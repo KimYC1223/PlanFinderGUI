@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build / distribution
+build/
+dist/
+*.spec
+*.egg-info/
+.eggs/
+
+# uv
+uv.lock
+
+# PyInstaller
+*.manifest
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Credentials / secrets
+google-credentials*.json
+*.key
+.env
+
+# Logs
+*.log
