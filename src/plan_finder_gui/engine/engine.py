@@ -115,7 +115,7 @@ async def run_discovery_loop(
     state_mgr = StateManager(report_dir)
     state_mgr.load()
 
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
 
     iteration = 0
     session_approved = 0
@@ -127,13 +127,9 @@ async def run_discovery_loop(
 
     stop_at_datetime = None
     if stop_at:
-        _start_time_obj = session_start_time.time()
-        _stop_date = session_start_time.date()
-        if stop_at <= _start_time_obj:
-            _stop_date += _td(days=1)
-        stop_at_datetime = _dt.combine(_stop_date, stop_at)
-        _day_str = "tomorrow" if _stop_date > session_start_time.date() else "today"
-        display.log(f"Session will stop at {stop_at.strftime('%H:%M')} {_day_str}.")
+        # stop_at is now a full datetime object
+        stop_at_datetime = stop_at
+        display.log(f"세션 중단 예정: {stop_at.strftime('%Y-%m-%d %H:%M')}")
 
     try:
         while True:
@@ -144,7 +140,7 @@ async def run_discovery_loop(
                 break
 
             if stop_at_datetime and _dt.now() >= stop_at_datetime:
-                display.log(f"Reached stop time ({stop_at.strftime('%H:%M')}). Stopping.")
+                display.log(f"중단 시간 도달 ({stop_at_datetime.strftime('%Y-%m-%d %H:%M')}). 중단.")
                 break
 
             await _wait_if_quiet_hours(display)

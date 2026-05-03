@@ -4,8 +4,9 @@ import asyncio
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QMessageBox,
     QSplitter,
@@ -15,11 +16,13 @@ from PySide6.QtWidgets import (
 
 from ..engine.engine import run_discovery_loop
 from ..engine.throttle import CcusageNotInstalled, SessionThrottle
+from .claude_session_panel import ClaudeSessionPanel
 from .config_panel import ConfigPanel
 from .gui_display import GuiDisplayAdapter
 from .log_panel import LogPanel
 from .report_browser import ReportBrowser
 from .status_bar import StatusBar
+from . import sound_player
 
 
 def _find_translated_helper(original: Path) -> Path | None:
@@ -39,9 +42,44 @@ class MainWindow(QMainWindow):
         self._task: asyncio.Task | None = None
         self._adapter: GuiDisplayAdapter | None = None
         self._session_cost: float = 0.0
+        self._is_resolve_session: bool = False
 
         self.setStyleSheet("QMainWindow { background: #1e1e1e; }")
+        self._build_menu()
         self._build_ui()
+
+    def _build_menu(self) -> None:
+        bar = self.menuBar()
+        bar.setStyleSheet(
+            "QMenuBar { background: #1e1e1e; color: #ccc; font-size: 13px; }"
+            "QMenuBar::item { padding: 4px 10px; background: transparent; }"
+            "QMenuBar::item:selected { background: #2a2d2e; }"
+            "QMenu { background: #2d2d2d; color: #ccc; border: 1px solid #444; }"
+            "QMenu::item { padding: 6px 20px; }"
+            "QMenu::item:selected { background: #094771; color: white; }"
+            "QMenu::separator { height: 1px; background: #444; margin: 2px 8px; }"
+        )
+
+        app_menu = bar.addMenu("PlanFinder")
+
+        pref_act = QAction("환경설정...", self)
+        pref_act.setShortcut("Ctrl+,")
+        pref_act.setMenuRole(QAction.MenuRole.PreferencesRole)
+        pref_act.triggered.connect(self._open_settings)
+        app_menu.addAction(pref_act)
+
+        app_menu.addSeparator()
+
+        quit_act = QAction("종료", self)
+        quit_act.setShortcut("Ctrl+Q")
+        quit_act.setMenuRole(QAction.MenuRole.QuitRole)
+        quit_act.triggered.connect(QApplication.quit)
+        app_menu.addAction(quit_act)
+
+    def _open_settings(self) -> None:
+        from .settings_dialog import SettingsDialog
+        dlg = SettingsDialog(self)
+        dlg.exec()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -65,6 +103,11 @@ class MainWindow(QMainWindow):
 
         self.config_panel = ConfigPanel()
         left_layout.addWidget(self.config_panel, stretch=1)
+
+        # Claude session info panel
+        self.claude_session_panel = ClaudeSessionPanel()
+        self.claude_session_panel.setContentsMargins(12, 0, 12, 8)
+        left_layout.addWidget(self.claude_session_panel)
 
         self.status_bar_widget = StatusBar()
         left_layout.addWidget(self.status_bar_widget)
@@ -130,22 +173,31 @@ class MainWindow(QMainWindow):
     #  Session management                                                  #
     # ------------------------------------------------------------------ #
 
+    def _warn(self, title: str, msg: str) -> None:
+        sound_player.play("buzz.wav")
+        QMessageBox.warning(self, title, msg)
+
     def start_session(self) -> None:
         config = self.config_panel.get_config()
 
         if not config["project_dir"]:
-            QMessageBox.warning(self, "Missing Input", "Please select a project directory.")
+            self._warn("Missing Input", "Please select a project directory.")
             return
         _project_path = Path(config["project_dir"])
         if not _project_path.exists():
-            QMessageBox.warning(self, "Invalid Path", "The specified path does not exist.")
+            self._warn("Invalid Path", "The specified path does not exist.")
             return
         if not _project_path.is_dir():
-            QMessageBox.warning(self, "Invalid Path", "Please select a directory, not a file.")
+            self._warn("Invalid Path", "Please select a directory, not a file.")
             return
         if not config["prompt"]:
-            QMessageBox.warning(self, "Missing Input", "Please enter a prompt.")
+            self._warn("Missing Input", "Please enter a prompt.")
             return
+        if config.get("stop_at") is not None:
+            from datetime import datetime as _dt
+            if config["stop_at"] <= _dt.now():
+                self._warn("잘못된 중단 시간", "중단 시간이 현재보다 과거입니다.")
+                return
 
         # Handle translation credentials check before starting
         post_save_hook = None
@@ -212,6 +264,10 @@ class MainWindow(QMainWindow):
             post_save_hook=post_save_hook,
         )
 
+        self._is_resolve_session = False
+        sound_player.play("button.wav")
+        sound_player.start_working_loop()
+
         self._task = asyncio.ensure_future(coro)
         self._task.add_done_callback(self._on_task_done)
 
@@ -225,6 +281,8 @@ class MainWindow(QMainWindow):
             self._adapter.cancel_pending()
 
     def _on_task_done(self, task: asyncio.Task) -> None:
+        sound_player.stop_working_loop()
+
         self.config_panel.start_btn.setEnabled(True)
         self.config_panel.stop_btn.setEnabled(False)
         self.status_bar_widget.set_running(False)
@@ -233,11 +291,17 @@ class MainWindow(QMainWindow):
         self.report_browser.refresh()
 
         if task.cancelled():
+            sound_player.play("tscrdy00.wav")
             self.log_panel.append_log("Session cancelled.", "warn")
         elif task.exception():
             exc = task.exception()
+            sound_player.play("tscrdy00.wav")
             self.log_panel.append_log(f"Session error: {exc}", "error")
         else:
+            if self._is_resolve_session:
+                sound_player.play("tadupd02.wav")
+            else:
+                sound_player.play("tscrdy00.wav")
             self.log_panel.append_log("Session completed.", "info")
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -296,6 +360,9 @@ class MainWindow(QMainWindow):
         a.plan_pending.connect(
             lambda plan, fp: QTimer.singleShot(100, self.report_browser.refresh)
         )
+        a.plan_pending.connect(
+            lambda plan, fp: sound_player.play("transmission.wav")
+        )
 
         a.no_more_plans.connect(
             lambda: self.log_panel.append_log(
@@ -344,6 +411,9 @@ class MainWindow(QMainWindow):
 
         from ..engine.executor import run_resolve_session
 
+        self._is_resolve_session = True
+        sound_player.start_working_loop()
+
         coro = run_resolve_session(
             plan_paths=moved,
             display=self._adapter,
@@ -388,6 +458,9 @@ class MainWindow(QMainWindow):
         self._wire_signals()
 
         from ..engine.executor import run_resolve_session
+
+        self._is_resolve_session = True
+        sound_player.start_working_loop()
 
         coro = run_resolve_session(
             plan_paths=plan_paths,

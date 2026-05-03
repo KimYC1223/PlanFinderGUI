@@ -1,36 +1,44 @@
 from __future__ import annotations
 
 import os
+import platform
+import subprocess
+from pathlib import Path
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 
-class GoogleAuthDialog(QDialog):
-    """Shows at startup if Google Translate is selected but no credentials saved."""
+def _adc_path() -> Path:
+    """Application Default Credentials file path (platform-aware)."""
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        return Path(appdata) / "gcloud" / "application_default_credentials.json"
+    return Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
 
-    _SETTINGS_KEY = "google_credentials_path"
+
+class GoogleAuthDialog(QDialog):
+    """Shown when gcloud Application Default Credentials are not found.
+
+    Guides the user to run `gcloud auth application-default login` and
+    verifies the ADC file exists before accepting.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Google Cloud Credentials")
-        self.setMinimumWidth(480)
+        self.setWindowTitle("Google Cloud 인증 필요")
+        self.setMinimumWidth(520)
         self.setStyleSheet(
             "QDialog { background: #1e1e1e; color: #ccc; }"
             "QLabel { color: #ccc; font-size: 12px; }"
-            "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
-            "  border-radius: 4px; padding: 4px 8px; font-size: 12px; }"
-            "QLineEdit:focus { border-color: #0e78d5; }"
             "QPushButton { background: #333; color: #ccc; border-radius: 4px;"
             "  padding: 4px 12px; font-size: 12px; }"
             "QPushButton:hover { background: #444; }"
@@ -39,118 +47,113 @@ class GoogleAuthDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         info = QLabel(
-            "To use Google Translate, you need a Google Cloud service account credentials file.\n\n"
-            "1. Go to the Google Cloud Console and create a service account.\n"
-            "2. Enable the Cloud Translation API.\n"
-            "3. Download the JSON credentials file.\n"
-            "4. Provide the path to that file below."
+            "Google Translate를 사용하려면 gcloud CLI 인증이 필요합니다.\n"
+            "터미널에서 아래 명령을 실행한 뒤 '인증 완료' 버튼을 눌러주세요."
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color: #aaa; font-size: 11px; line-height: 1.5;")
+        info.setStyleSheet("color: #aaa; font-size: 12px; line-height: 1.5;")
         layout.addWidget(info)
 
-        path_label = QLabel("Credentials JSON path:")
-        layout.addWidget(path_label)
-
-        path_row = QHBoxLayout()
-        self._path_edit = QLineEdit()
-        self._path_edit.setPlaceholderText("/path/to/credentials.json")
-
-        # Restore previously saved value if any
-        s = QSettings()
-        saved = s.value(self._SETTINGS_KEY, "")
-        if saved:
-            self._path_edit.setText(str(saved))
-
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedWidth(80)
-        browse_btn.clicked.connect(self._browse)
-        path_row.addWidget(self._path_edit)
-        path_row.addWidget(browse_btn)
-        layout.addLayout(path_row)
-
-        self._error_label = QLabel("")
-        self._error_label.setStyleSheet("color: #f44336; font-size: 11px;")
-        self._error_label.setVisible(False)
-        layout.addWidget(self._error_label)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        # Command block
+        cmd_label = QLabel("gcloud auth application-default login")
+        cmd_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cmd_label.setStyleSheet(
+            "font-family: 'Menlo', 'Consolas', monospace;"
+            "font-size: 13px;"
+            "background: #111;"
+            "color: #50fa7b;"
+            "padding: 10px 14px;"
+            "border-radius: 4px;"
+            "border: 1px solid #333;"
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setStyleSheet(
+        layout.addWidget(cmd_label)
+
+        # Copy + open terminal button row
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        copy_btn = QPushButton("명령어 복사")
+        copy_btn.clicked.connect(self._copy_command)
+        btn_row.addWidget(copy_btn)
+
+        terminal_btn = QPushButton("터미널 열기")
+        terminal_btn.clicked.connect(self._open_terminal)
+        btn_row.addWidget(terminal_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        # Status feedback
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet("font-size: 11px;")
+        self._status_label.setVisible(False)
+        layout.addWidget(self._status_label)
+
+        # OK / Cancel
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        check_btn = buttons.addButton("인증 완료", QDialogButtonBox.ButtonRole.AcceptRole)
+        check_btn.setStyleSheet(
             "QPushButton { background: #0e78d5; color: white; border-radius: 4px;"
             "  padding: 4px 16px; font-weight: bold; }"
             "QPushButton:hover { background: #1e88e5; }"
         )
-        buttons.accepted.connect(self._on_accept)
+        buttons.accepted.connect(self._on_check)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Google Cloud Credentials JSON",
-            self._path_edit.text() or "",
-            "JSON files (*.json);;All files (*)",
-        )
-        if path:
-            self._path_edit.setText(path)
+    def _copy_command(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("gcloud auth application-default login")
+        self._set_status("클립보드에 복사됐습니다.", success=True)
 
-    def _on_accept(self) -> None:
-        path = self._path_edit.text().strip()
-        if not path:
-            self._show_error("Please provide a credentials file path.")
-            return
+    def _open_terminal(self) -> None:
+        try:
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", "-a", "Terminal"])
+            elif platform.system() == "Windows":
+                subprocess.Popen(["cmd.exe"])
+            else:
+                for term in ("gnome-terminal", "xterm", "konsole"):
+                    try:
+                        subprocess.Popen([term])
+                        break
+                    except FileNotFoundError:
+                        continue
+        except Exception:
+            pass
 
-        import pathlib
-        p = pathlib.Path(path)
-        if not p.exists():
-            self._show_error("File not found. Please check the path.")
-            return
-        if not p.is_file():
-            self._show_error("Path does not point to a file.")
-            return
+    def _on_check(self) -> None:
+        if _adc_path().exists():
+            self.accept()
+        else:
+            self._set_status(
+                f"인증 파일을 찾을 수 없습니다. ({_adc_path()})\n"
+                "명령을 실행한 뒤 다시 눌러주세요.",
+                success=False,
+            )
 
-        # Save to settings and environment
-        s = QSettings()
-        s.setValue(self._SETTINGS_KEY, path)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-        self.accept()
-
-    def _show_error(self, msg: str) -> None:
-        self._error_label.setText(msg)
-        self._error_label.setVisible(True)
+    def _set_status(self, msg: str, *, success: bool) -> None:
+        color = "#66bb6a" if success else "#f44336"
+        self._status_label.setStyleSheet(f"font-size: 11px; color: {color};")
+        self._status_label.setText(msg)
+        self._status_label.setVisible(True)
 
     # ------------------------------------------------------------------ #
-    #  Static helpers                                                      #
+    #  Static helpers (same interface as before)                           #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def load_saved_credentials() -> bool:
-        """Load from QSettings if exists. Returns True if found and valid."""
-        s = QSettings()
-        path = s.value(GoogleAuthDialog._SETTINGS_KEY, "")
-        if not path:
-            return False
-
-        import pathlib
-        p = pathlib.Path(str(path))
-        if not p.exists() or not p.is_file():
-            return False
-
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(p)
-        return True
+        """True if ADC credentials file exists."""
+        return _adc_path().exists()
 
     @staticmethod
     def ensure_credentials(parent: QWidget | None = None) -> bool:
-        """Load saved credentials, or show dialog if missing.
-
-        Returns True if credentials are ready.
-        """
+        """Return True if ADC is ready; show dialog if not."""
         if GoogleAuthDialog.load_saved_credentials():
             return True
         dlg = GoogleAuthDialog(parent)

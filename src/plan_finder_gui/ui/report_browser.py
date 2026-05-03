@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from . import sound_player
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -235,6 +236,20 @@ _CATEGORY_ICONS = {
     "reject":   "✗",
 }
 
+_CATEGORY_BG = {
+    "pending":  "#221e10",
+    "working":  "#0d1a2a",
+    "reviewed": "#0e1e0e",
+    "reject":   "#1e0e0e",
+}
+
+_CATEGORY_LABELS = {
+    "pending":  "대기 중",
+    "working":  "진행 중",
+    "reviewed": "완료",
+    "reject":   "거절됨",
+}
+
 
 class ReportBrowser(QWidget):
     """File tree browser + markdown viewer that replaces the PlanCard idle state.
@@ -280,8 +295,9 @@ class ReportBrowser(QWidget):
         root.addWidget(self._banner)
 
         # Horizontal splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background: #333; width: 1px; }")
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setStyleSheet("QSplitter::handle { background: #333; width: 1px; }")
+        splitter = self._splitter
 
         # ---- Left: file tree + button bar ----
         left_widget = QWidget()
@@ -304,6 +320,8 @@ class ReportBrowser(QWidget):
             "QTreeWidget::branch:closed:has-children:has-siblings {"
             "  border-image: none; image: url(none); color: #ccc;"
             "}"
+            "QScrollBar:vertical { width: 0px; }"
+            "QScrollBar:horizontal { height: 0px; }"
         )
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
@@ -348,14 +366,16 @@ class ReportBrowser(QWidget):
             "QTextBrowser {"
             "  background: #252526; color: #d4d4d4;"
             "  border: none;"
-            "  padding: 0;"
+            "  padding: 10px;"
             "}"
+            "QScrollBar:vertical { width: 0px; }"
+            "QScrollBar:horizontal { height: 0px; }"
         )
-        self._viewer.setPlaceholderText("파일을 선택하면 내용이 표시됩니다.")
         self._viewer.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._viewer.customContextMenuRequested.connect(self._on_viewer_context_menu)
+        self._viewer.setVisible(False)
         splitter.addWidget(self._viewer)
-        splitter.setSizes([280, 720])
+        splitter.setSizes([1, 0])
         root.addWidget(splitter, stretch=1)
 
     # ------------------------------------------------------------------ #
@@ -364,7 +384,7 @@ class ReportBrowser(QWidget):
 
     def set_report_dir(self, path: Path) -> None:
         self._report_dir = path
-        self._viewer.clear()
+        self._deselect_file()
         self.refresh()
 
     def refresh(self) -> None:
@@ -384,10 +404,12 @@ class ReportBrowser(QWidget):
                 )
 
             color = _CATEGORY_COLORS.get(cat, "#ccc")
-            icon  = _CATEGORY_ICONS.get(cat, "")
-            folder_item = QTreeWidgetItem([f"  {icon}  {cat}  ({len(files)})"])
+            bg    = _CATEGORY_BG.get(cat, "#2a2a2a")
+            label = _CATEGORY_LABELS.get(cat, cat)
+            folder_item = QTreeWidgetItem([f"  {label}  ({len(files)})"])
             folder_item.setData(0, Qt.ItemDataRole.UserRole, ("folder", cat))
             folder_item.setForeground(0, QColor(color))
+            folder_item.setBackground(0, QColor(bg))
 
             for f in files:
                 name = _display_name(f)
@@ -416,13 +438,30 @@ class ReportBrowser(QWidget):
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data and data[0] == "file":
-            self._show_file(Path(data[1]))
+            path = Path(data[1])
+            if path == self._current_file:
+                # Same file clicked again → deselect
+                self._deselect_file()
+                self._tree.clearSelection()
+            else:
+                self._show_file(path)
+        elif data and data[0] == "folder":
+            # Folder clicked → deselect any open file
+            self._deselect_file()
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         self._update_buttons()
 
+    def _deselect_file(self) -> None:
+        self._current_file = None
+        self._viewer.setVisible(False)
+
     def _show_file(self, original: Path) -> None:
+        was_hidden = not self._viewer.isVisible()
         self._current_file = original
+        if was_hidden:
+            self._viewer.setVisible(True)
+            self._splitter.setSizes([280, 720])
         translated = _find_translated(original)
         target = translated if (translated and translated.exists()) else original
         if not target.exists():
@@ -505,7 +544,11 @@ class ReportBrowser(QWidget):
             reveal_act = menu.addAction("파일 탐색기에서 보기")
         else:
             reveal_act = menu.addAction("파일 관리자에서 보기")
-        browser_act = menu.addAction("브라우저에서 열기")
+
+        translate_act = None
+        if not _is_translated(path) and _find_translated(path) is None:
+            menu.addSeparator()
+            translate_act = menu.addAction("번역하기")
 
         chosen = menu.exec(global_pos)
 
@@ -513,8 +556,81 @@ class ReportBrowser(QWidget):
             _open_file(path)
         elif chosen == reveal_act:
             _reveal_in_explorer(path)
-        elif chosen == browser_act:
-            _open_in_browser(path)
+        elif translate_act is not None and chosen == translate_act:
+            self._translate_file(path)
+
+    def _translate_file(self, path: Path) -> None:
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import (
+            QApplication, QComboBox, QDialog, QDialogButtonBox,
+            QLabel, QMessageBox, QVBoxLayout,
+        )
+        from ..engine.translator import save_translated, translate_with_claude, translate_with_google
+
+        settings = QSettings()
+        saved_method = str(settings.value("translate_method", "Google Translate API"))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("번역하기")
+        dialog.setFixedWidth(300)
+        dialog.setStyleSheet(
+            "QDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; font-size: 12px; }"
+            "QComboBox {"
+            "  background: #3c3c3c; color: #ccc;"
+            "  border: 1px solid #555; padding: 4px 8px;"
+            "}"
+            "QComboBox QAbstractItemView { background: #3c3c3c; color: #ccc; }"
+            "QPushButton {"
+            "  background: #0e639c; color: white;"
+            "  border: none; padding: 6px 16px;"
+            "}"
+            "QPushButton:hover { background: #1177bb; }"
+        )
+        dlg_layout = QVBoxLayout(dialog)
+        dlg_layout.setSpacing(10)
+        dlg_layout.setContentsMargins(16, 16, 16, 16)
+        dlg_layout.addWidget(QLabel("번역 방법을 선택하세요:"))
+        combo = QComboBox()
+        combo.addItems(["Google Translate API", "Claude"])
+        idx = combo.findText(saved_method)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        dlg_layout.addWidget(combo)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        method = combo.currentText()
+
+        if "Google" in method:
+            from .google_auth_dialog import GoogleAuthDialog
+            if not GoogleAuthDialog.ensure_credentials(self):
+                return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            content = path.read_text(encoding="utf-8")
+            if "Google" in method:
+                translated_text = translate_with_google(content)
+            else:
+                translated_text = translate_with_claude(content)
+            save_translated(path, translated_text)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            QMessageBox.warning(self, "번역 실패", f"번역 중 오류가 발생했습니다:\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        sound_player.play("trescue.wav")
+        if self._current_file == path:
+            self._show_file(path)
 
     # ------------------------------------------------------------------ #
     #  Button state management                                             #
@@ -588,13 +704,30 @@ class ReportBrowser(QWidget):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _extract_h1(path: Path) -> str | None:
+    """Return the first '# ...' heading text in the file, or None."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                return stripped[2:].strip()
+    except Exception:
+        pass
+    return None
+
+
 def _display_name(original: Path) -> str:
-    """Display name: strip language suffix if translated version exists."""
-    translated = _find_translated(original)
-    if translated:
-        parts = translated.stem.rsplit(".", 1)
-        return parts[0] if len(parts) == 2 else translated.stem
-    return original.stem
+    """Show H1 heading from translated file if available, else from original.
+    Falls back to filename stem when no H1 is found.
+    """
+    source = _find_translated(original) or original
+    h1 = _extract_h1(source)
+    if h1:
+        return h1
+    # Fallback: stem without language suffix (e.g. plan.ko → plan)
+    stem = source.stem
+    parts = stem.rsplit(".", 1)
+    return parts[0] if len(parts) == 2 and len(parts[1]) == 2 else stem
 
 
 def _open_file(path: Path) -> None:

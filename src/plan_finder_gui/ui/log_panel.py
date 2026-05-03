@@ -45,6 +45,8 @@ class LogPanel(QWidget):
             "  border: none;"
             "  padding: 4px;"
             "}"
+            "QScrollBar:vertical { width: 0px; }"
+            "QScrollBar:horizontal { height: 0px; }"
         )
         layout.addWidget(self._log_edit)
 
