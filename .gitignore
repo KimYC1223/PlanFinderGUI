@@ -13,12 +13,8 @@ env/
 # Build / distribution
 build/
 dist/
-*.spec
 *.egg-info/
 .eggs/
-
-# uv
-uv.lock
 
 # PyInstaller
 *.manifest
