@@ -1,6 +1,6 @@
 [project]
 name = "plan-finder-gui"
-version = "0.1.0"
+version = "1.0.0"
 description = "Cross-platform GUI for the plan-finder AI code improvement tool"
 requires-python = ">=3.11"
 dependencies = [
