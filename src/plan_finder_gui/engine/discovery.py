@@ -13,6 +13,7 @@ from claude_agent_sdk import (
 )
 
 from .models import DiscoveredPlan
+from .tool_summary import summarize_tool
 
 
 @dataclass
@@ -63,6 +64,29 @@ async def discover_plan(
     if resume_session_id:
         options.resume = resume_session_id
 
+    from .executor import _resolve_anthropic_api_key, _resolve_cli_path, _show_error
+    try:
+        cli_path = _resolve_cli_path()
+        if cli_path:
+            options.cli_path = cli_path
+    except Exception as e:
+        _show_error(
+            "Claude CLI 경로 적용 실패",
+            "ClaudeAgentOptions에 cli_path를 적용하는 중 오류가 발생했습니다.",
+            e,
+        )
+
+    try:
+        api_key = _resolve_anthropic_api_key()
+        if api_key:
+            options.env = {**(options.env or {}), "ANTHROPIC_API_KEY": api_key}
+    except Exception as e:
+        _show_error(
+            "Anthropic API Key 적용 실패",
+            "ClaudeAgentOptions에 API 키를 적용하는 중 오류가 발생했습니다.",
+            e,
+        )
+
     async def _run_query() -> DiscoveryResult:
         plan: DiscoveredPlan | None = None
         cost: float = 0.0
@@ -80,7 +104,7 @@ async def discover_plan(
                     if isinstance(block, ToolUseBlock):
                         has_tool_use = True
                         if on_activity:
-                            detail = _summarize_tool(block.name, block.input)
+                            detail = summarize_tool(block.name, block.input)
                             on_activity(detail)
                 if has_tool_use:
                     turns += 1
@@ -103,32 +127,16 @@ async def discover_plan(
             model=_model, num_turns=turns,
         )
 
-    return await asyncio.wait_for(_run_query(), timeout=QUERY_TIMEOUT_SECONDS)
+    try:
+        return await asyncio.wait_for(_run_query(), timeout=QUERY_TIMEOUT_SECONDS)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        raise
+    except Exception as e:
+        _show_error(
+            "Discovery 쿼리 오류",
+            "discover_plan 실행 중 예외가 발생했습니다.",
+            e,
+        )
+        raise
 
 
-def _summarize_tool(name: str, inp: dict) -> str:
-    """Create a short human-readable summary of a tool call."""
-    if name == "Read":
-        path = inp.get("file_path", "")
-        return f"Reading {_short_path(path)}"
-    if name == "Glob":
-        return f"Searching {inp.get('pattern', '')}"
-    if name == "Grep":
-        pattern = inp.get("pattern", "")
-        path = inp.get("path", "")
-        suffix = f" in {_short_path(path)}" if path else ""
-        return f"Grep '{pattern}'{suffix}"
-    if name == "Bash":
-        cmd = inp.get("command", "")
-        if len(cmd) > 60:
-            cmd = cmd[:57] + "..."
-        return f"$ {cmd}"
-    return f"{name}(...)"
-
-
-def _short_path(path: str) -> str:
-    """Shorten a path to last 2 components."""
-    parts = path.replace("\\", "/").split("/")
-    if len(parts) > 2:
-        return "/".join(parts[-2:])
-    return path

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime as ddatetime
 
-from PySide6.QtCore import QDate, QPoint, QSettings, Qt, QTime
+from PySide6.QtCore import QDate, QObject, QPoint, QSettings, Qt, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +25,41 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+
+def _validate_anthropic_key(key: str) -> bool:
+    """Ping /v1/models to verify the API key is accepted by Anthropic."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=1",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return False
+
+
+class _ApiKeyValidator(QObject):
+    """Worker that validates an Anthropic API key off the UI thread."""
+
+    finished = Signal(bool, str)  # (is_valid, key_that_was_checked)
+
+    def __init__(self, key: str) -> None:
+        super().__init__()
+        self._key = key
+
+    def run(self) -> None:
+        valid = _validate_anthropic_key(self._key)
+        self.finished.emit(valid, self._key)
+
 _MODELS = [
     "claude-opus-4-5",
     "claude-sonnet-4-5",
@@ -42,7 +77,7 @@ class ConfigPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(260)
-        self.setMaximumWidth(380)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background: #1e1e1e;")
 
         outer = QVBoxLayout(self)
@@ -60,17 +95,45 @@ class ConfigPanel(QWidget):
 
         inner = QWidget()
         inner.setStyleSheet("background: #1e1e1e;")
+        inner.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(12)
         scroll.setWidget(inner)
 
-        # ── 타이틀 ──────────────────────────────────────────────
-        title = QLabel("Plan Finder")
-        title.setStyleSheet(
-            "color: #e8e8e8; font-size: 16px; font-weight: bold; padding: 4px 0;"
+        # ── API 키 ──────────────────────────────────────────────
+        api_group = _group("API 키")
+        api_form = _form()
+
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("sk-ant-…")
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.setFixedHeight(_INPUT_H)
+        _style_input(self.api_key_edit)
+
+        api_form.addRow(_label("PlanFinder용 API Key"), _with_info(self.api_key_edit, _INFO_API_KEY))
+        api_group.layout().addLayout(api_form)
+
+        self.api_key_status_label = QLabel(
+            "현재 로컬에 로그인된 Claude 정보를 사용하여 동작합니다."
         )
-        layout.addWidget(title)
+        self.api_key_status_label.setWordWrap(True)
+        self.api_key_status_label.setStyleSheet(
+            "color: #888; font-size: 11px; background: transparent; padding-top: 2px;"
+        )
+        api_group.layout().addWidget(self.api_key_status_label)
+        layout.addWidget(api_group)
+
+        # Debounce key validation so we don't ping the API on every keystroke.
+        self._api_key_validation_timer = QTimer(self)
+        self._api_key_validation_timer.setSingleShot(True)
+        self._api_key_validation_timer.setInterval(600)
+        self._api_key_validation_timer.timeout.connect(self._start_api_key_validation)
+        self._api_key_validator_thread: QThread | None = None
+        self._api_key_validator_worker: _ApiKeyValidator | None = None
+        self.api_key_edit.textChanged.connect(self._on_api_key_text_changed)
 
         # ── 프로젝트 ─────────────────────────────────────────────
         proj_group = _group("프로젝트")
@@ -95,22 +158,55 @@ class ConfigPanel(QWidget):
 
         proj_form.addRow(_label("디렉토리"), _wrap(dir_row))
         proj_group.layout().addLayout(proj_form)
-        layout.addWidget(proj_group)
+        proj_group.layout().addStretch()
+        layout.addWidget(proj_group, stretch=1)
 
         # ── 프롬프트 ─────────────────────────────────────────────
         prompt_group = _group("프롬프트")
+
+        # Preset selector row
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(4)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setFixedHeight(_INPUT_H)
+        self.preset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        _style_combo(self.preset_combo)
+        preset_refresh_btn = QPushButton("↻")
+        preset_refresh_btn.setFixedSize(_INPUT_H, _INPUT_H)
+        preset_refresh_btn.setToolTip("프리셋 목록 새로고침")
+        preset_refresh_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; border-radius: 3px; }"
+            "QPushButton:hover { background: #444; }"
+        )
+        preset_refresh_btn.clicked.connect(self.refresh_presets)
+        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_row.addWidget(preset_refresh_btn)
+        prompt_group.layout().addLayout(preset_row)
+
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText(
             "예: 버그 찾기, 에러 처리 개선, 타입 힌트 추가…"
         )
         self.prompt_edit.setMinimumHeight(80)
-        self.prompt_edit.setMaximumHeight(140)
+        self.prompt_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.prompt_edit.setStyleSheet(
             "QTextEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
             "border-radius: 4px; padding: 4px 6px; font-size: 12px; }"
+            "QTextEdit:read-only { background: #262626; color: #aaa; }"
         )
         prompt_group.layout().addWidget(self.prompt_edit)
-        layout.addWidget(prompt_group)
+        layout.addWidget(prompt_group, stretch=4)
+
+        # Stash custom-typed prompt so we can restore it when toggling between
+        # presets and "직접 입력". Populated from QSettings in restore_settings().
+        self._custom_prompt: str = ""
+        self._loading_preset: bool = False  # guard against textChanged feedback
+        self.prompt_edit.textChanged.connect(self._on_prompt_text_changed)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        self.refresh_presets()
 
         # ── 세션 설정 ─────────────────────────────────────────────
         sess_group = _group("세션 설정")
@@ -164,7 +260,6 @@ class ConfigPanel(QWidget):
         self.stop_at_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.stop_at_date_edit.setDate(QDate.currentDate())
         self.stop_at_date_edit.setCalendarPopup(True)
-        self.stop_at_date_edit.setEnabled(False)
         self.stop_at_date_edit.setFixedHeight(_INPUT_H)
         self.stop_at_date_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _style_spin(self.stop_at_date_edit)
@@ -172,19 +267,30 @@ class ConfigPanel(QWidget):
         self.stop_at_time_edit = QTimeEdit()
         self.stop_at_time_edit.setDisplayFormat("HH:mm")
         self.stop_at_time_edit.setTime(QTime(7, 30))
-        self.stop_at_time_edit.setEnabled(False)
         self.stop_at_time_edit.setFixedHeight(_INPUT_H)
         self.stop_at_time_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _style_spin(self.stop_at_time_edit)
 
+        self.stop_at_hint = QLabel("체크하면 종료할 날짜·시간을 선택할 수 있습니다.")
+        self.stop_at_hint.setStyleSheet(
+            "color: #888; font-size: 12px; background: transparent;"
+        )
+        self.stop_at_hint.setFixedHeight(_INPUT_H)
+        self.stop_at_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
         def _toggle_stop_at(checked: bool) -> None:
-            self.stop_at_date_edit.setEnabled(checked)
-            self.stop_at_time_edit.setEnabled(checked)
+            self.stop_at_date_edit.setVisible(checked)
+            self.stop_at_time_edit.setVisible(checked)
+            self.stop_at_hint.setVisible(not checked)
 
         self.stop_at_check.toggled.connect(_toggle_stop_at)
         stop_row.addWidget(self.stop_at_check)
         stop_row.addWidget(self.stop_at_date_edit)
         stop_row.addWidget(self.stop_at_time_edit)
+        stop_row.addWidget(self.stop_at_hint, stretch=1)
+        # Initial state: checkbox starts unchecked, so hide editors and show hint.
+        self.stop_at_date_edit.setVisible(False)
+        self.stop_at_time_edit.setVisible(False)
 
         stop_with_info = QHBoxLayout()
         stop_with_info.setContentsMargins(0, 0, 0, 0)
@@ -194,7 +300,8 @@ class ConfigPanel(QWidget):
         sess_form.addRow(_label("중단 시간"), _wrap(stop_with_info))
 
         sess_group.layout().addLayout(sess_form)
-        layout.addWidget(sess_group)
+        sess_group.layout().addStretch()
+        layout.addWidget(sess_group, stretch=2)
 
         # ── 옵션 ────────────────────────────────────────────────
         opts_group = _group("옵션")
@@ -215,7 +322,8 @@ class ConfigPanel(QWidget):
             row.addStretch()
             row.addWidget(_info_btn(info))
             opts_group.layout().addLayout(row)
-        layout.addWidget(opts_group)
+        opts_group.layout().addStretch()
+        layout.addWidget(opts_group, stretch=1)
 
         # ── 번역 ────────────────────────────────────────────────
         trans_group = _group("번역")
@@ -232,15 +340,13 @@ class ConfigPanel(QWidget):
         trans_group.layout().addWidget(self.translate_method_combo)
 
         self.translate_check.toggled.connect(self.translate_method_combo.setVisible)
-        layout.addWidget(trans_group)
-
-        layout.addStretch()
+        trans_group.layout().addStretch()
+        layout.addWidget(trans_group, stretch=1)
 
         self.restore_settings()
 
-        # ── 시작 / 중단 버튼 ──────────────────────────────────────
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        # Start / Stop buttons live here as attributes only — MainWindow
+        # reparents them into a fixed footer at the bottom of the sidebar.
         self.start_btn = QPushButton("▶  시작")
         self.start_btn.setFixedHeight(36)
         self.start_btn.setStyleSheet(
@@ -258,17 +364,6 @@ class ConfigPanel(QWidget):
             "QPushButton:hover { background: #555; }"
             "QPushButton:disabled { background: #2a2a2a; color: #555; }"
         )
-        btn_row.addWidget(self.start_btn)
-        btn_row.addWidget(self.stop_btn)
-
-        btn_container = QWidget()
-        btn_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        btn_container.setStyleSheet("background: #1e1e1e;")
-        bc_layout = QVBoxLayout(btn_container)
-        bc_layout.setContentsMargins(12, 8, 12, 12)
-        bc_layout.setSpacing(0)
-        bc_layout.addLayout(btn_row)
-        outer.addWidget(btn_container)
 
     # ------------------------------------------------------------------ #
 
@@ -278,6 +373,10 @@ class ConfigPanel(QWidget):
             qd = self.stop_at_date_edit.date()
             qt = self.stop_at_time_edit.time()
             stop_at = ddatetime(qd.year(), qd.month(), qd.day(), qt.hour(), qt.minute())
+
+        # Only expose the API key if the latest validation marked it valid —
+        # QSettings is the source of truth here (we clear it on invalid).
+        validated_key = str(QSettings().value("anthropic_api_key", "") or "")
 
         return {
             "project_dir":      self.project_dir_edit.text().strip(),
@@ -292,12 +391,16 @@ class ConfigPanel(QWidget):
             "stop_at":          stop_at,
             "translate_enabled":self.translate_check.isChecked(),
             "translate_method": self.translate_method_combo.currentText(),
+            "anthropic_api_key": validated_key,
         }
 
     def save_settings(self) -> None:
         s = QSettings()
         s.setValue("project_dir",       self.project_dir_edit.text())
-        s.setValue("prompt",            self.prompt_edit.toPlainText())
+        # Persist the user's custom prompt independently from any preset body
+        # so switching to "직접 입력" restores their last-typed text.
+        s.setValue("prompt",            self._custom_prompt)
+        s.setValue("preset",            self.preset_combo.currentData() or "")
         s.setValue("model",             self.model_combo.currentText())
         s.setValue("budget",            self.budget_spin.value())
         s.setValue("max_iter",          self.max_iter_spin.value())
@@ -315,13 +418,40 @@ class ConfigPanel(QWidget):
     def restore_settings(self) -> None:
         s = QSettings()
 
+        # Pre-populate the API key edit but don't trigger a network call yet —
+        # we'll let the debounce timer handle revalidation. The status label
+        # starts in its "local Claude login" state, which is correct until we
+        # confirm the key still works.
+        saved_key = str(s.value("anthropic_api_key", "") or "")
+        if saved_key:
+            self.api_key_edit.blockSignals(True)
+            self.api_key_edit.setText(saved_key)
+            self.api_key_edit.blockSignals(False)
+            # Optimistically reflect the previously-validated state; the
+            # background revalidation below will correct us if the key has
+            # been revoked since then.
+            self._set_api_key_status(using_user_key=True)
+            QTimer.singleShot(0, self._start_api_key_validation)
+
         project_dir = s.value("project_dir", "")
         if project_dir:
             self.project_dir_edit.setText(str(project_dir))
 
         prompt = s.value("prompt", "")
-        if prompt:
-            self.prompt_edit.setPlainText(str(prompt))
+        self._custom_prompt = str(prompt) if prompt else ""
+
+        # Apply saved preset selection if it still exists; otherwise fall back
+        # to "직접 입력" with the user's saved custom prompt.
+        saved_preset = str(s.value("preset", "") or "")
+        idx = self.preset_combo.findData(saved_preset) if saved_preset else 0
+        if idx < 0:
+            idx = 0
+        self._loading_preset = True
+        self.preset_combo.setCurrentIndex(idx)
+        self._loading_preset = False
+        # Trigger the handler manually so the prompt edit reflects the choice
+        # even when the index didn't actually change.
+        self._on_preset_changed(idx)
 
         model = s.value("model", "")
         if model:
@@ -376,12 +506,135 @@ class ConfigPanel(QWidget):
         if idx >= 0:
             self.translate_method_combo.setCurrentIndex(idx)
 
+    # ------------------------------------------------------------------ #
+    #  API key validation                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _on_api_key_text_changed(self, _text: str) -> None:
+        # Restart the debounce timer on every keystroke.
+        self._api_key_validation_timer.start()
+
+    def _set_api_key_status(self, *, using_user_key: bool) -> None:
+        if using_user_key:
+            self.api_key_status_label.setText(
+                "이제 해당 API Key를 사용하여 Claude를 사용하여 동작합니다."
+            )
+            self.api_key_status_label.setStyleSheet(
+                "color: #4ec9b0; font-size: 11px; background: transparent;"
+                " padding-top: 2px;"
+            )
+        else:
+            self.api_key_status_label.setText(
+                "현재 로컬에 로그인된 Claude 정보를 사용하여 동작합니다."
+            )
+            self.api_key_status_label.setStyleSheet(
+                "color: #888; font-size: 11px; background: transparent;"
+                " padding-top: 2px;"
+            )
+
+    def _start_api_key_validation(self) -> None:
+        key = self.api_key_edit.text().strip()
+        if not key:
+            QSettings().remove("anthropic_api_key")
+            self._set_api_key_status(using_user_key=False)
+            return
+
+        # Cheap format guard: avoid network calls for clearly invalid input.
+        if not key.startswith("sk-ant-") or len(key) < 20:
+            QSettings().remove("anthropic_api_key")
+            self._set_api_key_status(using_user_key=False)
+            return
+
+        # We don't tear down any in-flight validator — _on_api_key_validated
+        # discards results whose `checked_key` doesn't match the current edit
+        # text, so stale callbacks are harmless.
+        thread = QThread(self)
+        worker = _ApiKeyValidator(key)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_api_key_validated)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._api_key_validator_thread = thread
+        self._api_key_validator_worker = worker
+        thread.start()
+
+    def _on_api_key_validated(self, valid: bool, checked_key: str) -> None:
+        # Discard stale results when the user has typed more since this
+        # validation was kicked off.
+        current = self.api_key_edit.text().strip()
+        if checked_key != current:
+            return
+
+        if valid and current:
+            QSettings().setValue("anthropic_api_key", current)
+            self._set_api_key_status(using_user_key=True)
+        else:
+            QSettings().remove("anthropic_api_key")
+            self._set_api_key_status(using_user_key=False)
+
     def _browse_project(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self, "프로젝트 디렉토리 선택", self.project_dir_edit.text() or ""
         )
         if path:
             self.project_dir_edit.setText(path)
+
+    # ------------------------------------------------------------------ #
+    #  Preset handling                                                     #
+    # ------------------------------------------------------------------ #
+
+    def refresh_presets(self) -> None:
+        """Re-scan bundled + user preset directories and rebuild the combo."""
+        from ..engine.preset import list_presets
+
+        prev = self.preset_combo.currentData() if self.preset_combo.count() else ""
+        self._loading_preset = True
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        # First entry: free-form custom prompt
+        self.preset_combo.addItem("직접 입력", "")
+        for p in list_presets():
+            self.preset_combo.addItem(p.title, p.name)
+        # Restore previous selection if still available
+        idx = self.preset_combo.findData(prev) if prev else 0
+        if idx < 0:
+            idx = 0
+        self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+        self._loading_preset = False
+        self._on_preset_changed(idx)
+
+    def _on_preset_changed(self, _idx: int) -> None:
+        """Sync the prompt edit with the currently selected preset."""
+        from ..engine.preset import load_preset
+
+        name = self.preset_combo.currentData() or ""
+        self._loading_preset = True
+        try:
+            if not name:
+                # "직접 입력" — restore the user's last custom prompt and unlock
+                self.prompt_edit.setReadOnly(False)
+                self.prompt_edit.setPlainText(self._custom_prompt)
+            else:
+                preset = load_preset(str(name))
+                if preset is None:
+                    # Preset disappeared (e.g. user removed file); fall back.
+                    self.prompt_edit.setReadOnly(False)
+                    self.prompt_edit.setPlainText(self._custom_prompt)
+                else:
+                    self.prompt_edit.setPlainText(preset.prompt)
+                    self.prompt_edit.setReadOnly(True)
+        finally:
+            self._loading_preset = False
+
+    def _on_prompt_text_changed(self) -> None:
+        """When 직접 입력 mode is active, remember the user's typed prompt."""
+        if self._loading_preset:
+            return
+        if not (self.preset_combo.currentData() or ""):
+            self._custom_prompt = self.prompt_edit.toPlainText()
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +651,7 @@ def _group(title: str) -> QGroupBox:
         "}"
         "QGroupBox::title { subcontrol-origin: margin; left: 8px; top: -1px; }"
     )
+    g.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
     inner = QVBoxLayout()
     inner.setContentsMargins(8, 8, 8, 8)
     inner.setSpacing(6)
@@ -475,6 +729,14 @@ def _wrap(layout) -> QWidget:
 # ---------------------------------------------------------------------------
 # (i) info button helpers
 # ---------------------------------------------------------------------------
+
+_INFO_API_KEY = (
+    "PlanFinder가 Claude API를 호출할 때 사용할 Anthropic API Key입니다.\n\n"
+    "• 비워두거나 유효하지 않으면 로컬에 로그인된 Claude(claude CLI) 정보를\n"
+    "  사용하여 동작합니다.\n"
+    "• 유효한 키를 입력하면 해당 키를 사용해 Claude를 호출합니다.\n\n"
+    "키는 로컬 설정에만 저장됩니다."
+)
 
 _INFO_MODEL = (
     "사용할 Claude 모델을 선택합니다.\n\n"

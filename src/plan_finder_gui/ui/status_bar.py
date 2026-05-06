@@ -79,6 +79,10 @@ class StatusBar(QWidget):
     def set_iteration(self, n: int) -> None:
         self._iter_label.setText(f"Iter: {n}")
 
+    def set_iteration_for(self, sid: str, n: int) -> None:
+        """Show the most recent per-session iteration tick."""
+        self._iter_label.setText(f"Iter: {sid}={n}")
+
     def update_cost(self, cost: float, tokens: int, turns: int) -> None:
         self._cumulative_cost += cost
         self._cumulative_tokens += tokens

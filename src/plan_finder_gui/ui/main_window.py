@@ -3,24 +3,32 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSplitter,
+    QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from ..engine.engine import run_discovery_loop
+from ..engine.session_manager import Session, SessionManager
 from ..engine.throttle import CcusageNotInstalled, SessionThrottle
 from .claude_session_panel import ClaudeSessionPanel
 from .config_panel import ConfigPanel
 from .gui_display import GuiDisplayAdapter
 from .log_panel import LogPanel
 from .report_browser import ReportBrowser
+from .sessions_panel import SessionsPanel
 from .status_bar import StatusBar
 from . import sound_player
 
@@ -39,14 +47,19 @@ def _find_translated_helper(original: Path) -> Path | None:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self._task: asyncio.Task | None = None
-        self._adapter: GuiDisplayAdapter | None = None
-        self._session_cost: float = 0.0
-        self._is_resolve_session: bool = False
+        self._session_manager = SessionManager(self)
+
+        # Set when the user explicitly chose to quit (tray menu / pre-confirmed
+        # close). Lets closeEvent skip the "send to tray?" prompt.
+        self._force_quit: bool = False
 
         self.setStyleSheet("QMainWindow { background: #1e1e1e; }")
         self._build_menu()
         self._build_ui()
+        self._build_tray()
+
+        self._session_manager.session_registered.connect(self._on_session_registered)
+        self._session_manager.session_unregistered.connect(self._on_session_unregistered)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -61,6 +74,13 @@ class MainWindow(QMainWindow):
         )
 
         app_menu = bar.addMenu("PlanFinder")
+
+        about_act = QAction("About PlanFinder GUI", self)
+        about_act.setMenuRole(QAction.MenuRole.AboutRole)
+        about_act.triggered.connect(self._show_about)
+        app_menu.addAction(about_act)
+
+        app_menu.addSeparator()
 
         pref_act = QAction("환경설정...", self)
         pref_act.setShortcut("Ctrl+,")
@@ -80,6 +100,106 @@ class MainWindow(QMainWindow):
         from .settings_dialog import SettingsDialog
         dlg = SettingsDialog(self)
         dlg.exec()
+        # Settings may have changed the preset directory — refresh the dropdown.
+        if hasattr(self, "config_panel"):
+            self.config_panel.refresh_presets()
+
+    def _show_about(self) -> None:
+        import sys
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import (
+            QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
+        )
+
+        sound_player.play_random(
+            "tscwht01.wav", "tscwht02.wav", "tscwht03.wav"
+        )
+
+        # Resolve icon path (frozen vs dev layout)
+        if getattr(sys, "frozen", False):
+            icon_path = Path(sys._MEIPASS) / "img" / "scv.webp"  # type: ignore[attr-defined]
+        else:
+            icon_path = Path(__file__).parents[3] / "img" / "scv.webp"
+
+        # Resolve version from package metadata, with hardcoded fallback
+        try:
+            from importlib.metadata import version
+            ver = version("plan-finder-gui")
+        except Exception:
+            ver = "0.1.0"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About PlanFinder GUI")
+        dlg.setFixedWidth(420)
+        dlg.setStyleSheet(
+            "QDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; }"
+            "QLabel a { color: #4fc3f7; text-decoration: none; }"
+            "QPushButton {"
+            "  background: #0e639c; color: white;"
+            "  border: none; padding: 6px 16px;"
+            "}"
+            "QPushButton:hover { background: #1177bb; }"
+        )
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        if icon_path.exists():
+            pix = QPixmap(str(icon_path))
+            if not pix.isNull():
+                icon_label = QLabel()
+                icon_label.setPixmap(
+                    pix.scaled(
+                        128, 128,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        title = QLabel("PlanFinder GUI")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #e8e8e8; padding-top: 8px;")
+        layout.addWidget(title)
+
+        ver_label = QLabel(f"Version {ver}")
+        ver_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ver_label.setStyleSheet("color: #aaa; font-size: 13px; padding-bottom: 6px;")
+        layout.addWidget(ver_label)
+
+        desc = QLabel(
+            "Claude AI를 활용해 코드베이스를 자동 분석하고<br>"
+            "개선 계획(Plan)을 생성하는 크로스플랫폼 데스크톱 앱입니다."
+        )
+        desc.setTextFormat(Qt.TextFormat.RichText)
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12px; color: #c0c0c0; padding: 4px 0 10px 0;")
+        layout.addWidget(desc)
+
+        credits = QLabel(
+            'Created by <b>KimYC1223</b><br>'
+            'Inspired by <b>kajebiii</b>\'s '
+            '<a href="https://github.com/kajebiii/plan-finder">plan-finder</a>'
+        )
+        credits.setTextFormat(Qt.TextFormat.RichText)
+        credits.setOpenExternalLinks(True)
+        credits.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        credits.setWordWrap(True)
+        credits.setStyleSheet(
+            "font-size: 12px; color: #b8b8b8;"
+            "border-top: 1px solid #3a3a3a; padding-top: 12px; margin-top: 4px;"
+        )
+        layout.addWidget(credits)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -94,23 +214,87 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setStyleSheet("QSplitter::handle { background: #333; width: 1px; }")
 
-        # Left panel
+        # Left panel — header (fixed) | tabs (scrollable) | start/stop (fixed)
         left = QWidget()
         left.setStyleSheet("background: #1e1e1e;")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
-        self.config_panel = ConfigPanel()
-        left_layout.addWidget(self.config_panel, stretch=1)
+        # ── Pinned header ─────────────────────────────────────────
+        header = QWidget()
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        header.setStyleSheet(
+            "background: #1e1e1e; border-bottom: 1px solid #2c2c2c;"
+        )
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 8)
+        header_layout.setSpacing(0)
+        header_title = QLabel("Plan Finder")
+        header_title.setStyleSheet(
+            "color: #e8e8e8; font-size: 16px; font-weight: bold;"
+        )
+        header_layout.addWidget(header_title)
+        left_layout.addWidget(header)
 
-        # Claude session info panel
+        # ── Tabs ──────────────────────────────────────────────────
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; background: #1e1e1e; }"
+            "QTabBar { background: #1e1e1e; }"
+            "QTabBar::tab {"
+            "  background: #252526; color: #aaa;"
+            "  padding: 6px 12px; font-size: 12px;"
+            "  border: 1px solid #2c2c2c; border-bottom: none;"
+            "}"
+            "QTabBar::tab:selected { background: #1e1e1e; color: #e8e8e8; }"
+            "QTabBar::tab:hover:!selected { background: #2a2d2e; color: #ccc; }"
+        )
+
+        # Tab 1: 활성 Claude 정보 ──────────────────────────────────
+        active_tab = QWidget()
+        active_tab.setStyleSheet("background: #1e1e1e;")
+        active_layout = QVBoxLayout(active_tab)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.setSpacing(0)
+
+        # Live PlanFinder sessions (with CPU sparklines)
+        self.sessions_panel = SessionsPanel(self._session_manager)
+        self.sessions_panel.setContentsMargins(12, 8, 12, 0)
+        active_layout.addWidget(self.sessions_panel)
+
+        # Claude session info panel (ccusage-driven aggregate stats).
         self.claude_session_panel = ClaudeSessionPanel()
         self.claude_session_panel.setContentsMargins(12, 0, 12, 8)
-        left_layout.addWidget(self.claude_session_panel)
+        active_layout.addWidget(self.claude_session_panel, stretch=1)
 
         self.status_bar_widget = StatusBar()
-        left_layout.addWidget(self.status_bar_widget)
+        active_layout.addWidget(self.status_bar_widget)
+
+        tabs.addTab(active_tab, "활성 Claude 정보")
+
+        # Tab 2: 검사 정보 ────────────────────────────────────────
+        self.config_panel = ConfigPanel()
+        tabs.addTab(self.config_panel, "검사 정보")
+
+        left_layout.addWidget(tabs, stretch=1)
+
+        # ── Pinned footer (Start / Stop) ──────────────────────────
+        footer = QWidget()
+        footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        footer.setStyleSheet(
+            "background: #1e1e1e; border-top: 1px solid #2c2c2c;"
+        )
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 8, 12, 12)
+        footer_layout.setSpacing(0)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addWidget(self.config_panel.start_btn)
+        btn_row.addWidget(self.config_panel.stop_btn)
+        footer_layout.addLayout(btn_row)
+        left_layout.addWidget(footer)
 
         splitter.addWidget(left)
 
@@ -134,7 +318,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(right_splitter)
         splitter.addWidget(right)
 
-        splitter.setSizes([300, 900])
+        splitter.setSizes([400, 900])
         root.addWidget(splitter)
 
         # Wire config buttons
@@ -178,6 +362,17 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, msg)
 
     def start_session(self) -> None:
+        from ..engine.executor import _show_error
+        try:
+            self._start_session_impl()
+        except Exception as e:
+            _show_error(
+                "Start 실패",
+                "Start 버튼 처리 중 예외가 발생했습니다.",
+                e,
+            )
+
+    def _start_session_impl(self) -> None:
         config = self.config_panel.get_config()
 
         if not config["project_dir"]:
@@ -189,6 +384,20 @@ class MainWindow(QMainWindow):
             return
         if not _project_path.is_dir():
             self._warn("Invalid Path", "Please select a directory, not a file.")
+            return
+        # macOS의 폴더 접근 권한 팝업을 지금 트리거해서, 나중에 대기 후
+        # 작업이 권한 다이얼로그에서 멈추는 일이 없도록 한다.
+        try:
+            next(iter(_project_path.iterdir()), None)
+        except PermissionError:
+            self._warn(
+                "권한 오류",
+                "프로젝트 디렉토리에 접근할 수 없습니다.\n"
+                "시스템 설정 → 개인정보 보호 및 보안에서 PlanFinder의 폴더 접근 권한을 허용해주세요.",
+            )
+            return
+        except OSError as e:
+            self._warn("디렉토리 오류", f"프로젝트 디렉토리를 읽을 수 없습니다: {e}")
             return
         if not config["prompt"]:
             self._warn("Missing Input", "Please enter a prompt.")
@@ -227,15 +436,7 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         self.log_panel.append_log(f"Translation failed: {e}", "warn")
 
-        # Reset UI state
-        self.status_bar_widget.reset()
-        self.status_bar_widget.set_running(True)
-        self.log_panel.clear_activity()
-        self.report_browser.set_running(True)
-
-        self._session_cost = 0.0
-        self._adapter = GuiDisplayAdapter(self)
-        self._wire_signals()
+        adapter = GuiDisplayAdapter(self)
 
         # Build throttle (gracefully disable if ccusage not available)
         throttle = None
@@ -243,7 +444,7 @@ class MainWindow(QMainWindow):
             try:
                 throttle = SessionThrottle(
                     session_budget=config["budget"],
-                    log_fn=self._adapter.log,
+                    log_fn=adapter.log,
                 )
             except CcusageNotInstalled as e:
                 self.log_panel.append_log(str(e), "warn")
@@ -251,7 +452,7 @@ class MainWindow(QMainWindow):
 
         coro = run_discovery_loop(
             plan_prompt=config["prompt"],
-            display=self._adapter,
+            display=adapter,
             max_iterations=config["max_iter"],
             cwd=config["project_dir"],
             auto=True,  # always auto
@@ -264,96 +465,347 @@ class MainWindow(QMainWindow):
             post_save_hook=post_save_hook,
         )
 
-        self._is_resolve_session = False
-        sound_player.play("button.wav")
-        sound_player.start_working_loop()
-
-        self._task = asyncio.ensure_future(coro)
-        self._task.add_done_callback(self._on_task_done)
-
-        self.config_panel.start_btn.setEnabled(False)
-        self.config_panel.stop_btn.setEnabled(True)
+        self._spawn_session(
+            label="Discovery",
+            adapter=adapter,
+            coro=coro,
+            is_resolve=False,
+        )
 
     def stop_session(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-        if self._adapter:
-            self._adapter.cancel_pending()
+        cancelled = self._session_manager.cancel_all()
+        for sess in self._session_manager.list():
+            sess.adapter.cancel_pending()
+        if cancelled:
+            self.log_panel.append_log(
+                f"Stop 요청: {cancelled}개 세션 취소 중...", "warn"
+            )
 
-    def _on_task_done(self, task: asyncio.Task) -> None:
-        sound_player.stop_working_loop()
+    def _spawn_session(
+        self,
+        label: str,
+        adapter: GuiDisplayAdapter,
+        coro,
+        is_resolve: bool,
+    ) -> Session:
+        sid = self._session_manager.new_id()
+        session = Session(sid, label, adapter, parent=self)
+        session.is_resolve = is_resolve  # type: ignore[attr-defined]
+        self._wire_session_signals(session)
+        self._session_manager.register(session)
 
-        self.config_panel.start_btn.setEnabled(True)
-        self.config_panel.stop_btn.setEnabled(False)
-        self.status_bar_widget.set_running(False)
-        self.log_panel.clear_activity()
-        self.report_browser.set_running(False)
-        self.report_browser.refresh()
+        session.task = asyncio.ensure_future(coro)
+        session.task.add_done_callback(
+            lambda t, s=session: self._on_session_task_done(s, t)
+        )
+
+        self.log_panel.append_log(f"[{sid}] {label} 세션 시작", "info")
+        sound_player.play("button.wav")
+        return session
+
+    def _on_session_registered(self, session: Session) -> None:
+        # First running session — start the looping audio + status indicator.
+        running_count = sum(
+            1 for s in self._session_manager.list() if s.state == "running"
+        )
+        if running_count == 1:
+            sound_player.start_working_loop()
+            self.status_bar_widget.set_running(True)
+            self.report_browser.set_running(True)
+            if self._tray is not None:
+                self._tray.setIcon(self._tray_icon_running)
+        self.config_panel.stop_btn.setEnabled(True)
+
+    def _on_session_unregistered(self, session: Session) -> None:
+        if not self._session_manager.any_running():
+            sound_player.stop_working_loop()
+            self.status_bar_widget.set_running(False)
+            self.log_panel.clear_activity()
+            self.report_browser.set_running(False)
+            self.report_browser.refresh()
+            self.config_panel.stop_btn.setEnabled(False)
+            if self._tray is not None:
+                self._tray.setIcon(self._tray_icon_idle)
+
+    def _on_session_task_done(self, session: Session, task: asyncio.Task) -> None:
+        is_resolve = bool(getattr(session, "is_resolve", False))
 
         if task.cancelled():
-            sound_player.play("tscrdy00.wav")
-            self.log_panel.append_log("Session cancelled.", "warn")
+            self._session_manager.mark_state(session, "cancelled")
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            self.log_panel.append_log(f"[{session.id}] Session cancelled.", "warn")
         elif task.exception():
             exc = task.exception()
-            sound_player.play("tscrdy00.wav")
-            self.log_panel.append_log(f"Session error: {exc}", "error")
+            self._session_manager.mark_state(session, "failed")
+            sound_player.play("buzz.wav")
+            self.log_panel.append_log(
+                f"[{session.id}] Session error: {exc}", "error"
+            )
+            from ..engine.executor import _show_error
+            _show_error(
+                "세션 비정상 종료",
+                f"[{session.id}] 비동기 세션이 예외로 종료되었습니다:\n"
+                f"{type(exc).__name__}: {exc}",
+                exc,
+            )
         else:
-            if self._is_resolve_session:
+            self._session_manager.mark_state(session, "completed")
+            if is_resolve:
                 sound_player.play("tadupd02.wav")
             else:
-                sound_player.play("tscrdy00.wav")
-            self.log_panel.append_log("Session completed.", "info")
+                sound_player.play("tscupd00.wav")
+            self.log_panel.append_log(f"[{session.id}] Session completed.", "info")
+
+        # Briefly leave the card visible in its terminal state, then drop it.
+        QTimer.singleShot(2500, lambda s=session: self._session_manager.unregister(s))
+
+    # ------------------------------------------------------------------ #
+    #  System tray                                                         #
+    # ------------------------------------------------------------------ #
+
+    _TRAY_ICON_SIZES = (16, 22, 32, 44, 128)
+
+    def _resolve_img_dir(self) -> Path:
+        """Return path to the bundled img/ folder (dev vs frozen layout)."""
+        import sys
+        if getattr(sys, "frozen", False):
+            return Path(sys._MEIPASS) / "img"  # type: ignore[attr-defined]
+        return Path(__file__).parents[3] / "img"
+
+    def _select_tray_color(self) -> str:
+        """Pick 'black' or 'white' icon set based on platform/theme.
+
+        macOS uses the black silhouette as a template mask — the system
+        auto-inverts per dark/light mode, so the source color doesn't matter
+        much. On Windows/Linux there is no template mode, so we pick the
+        color that contrasts with the current taskbar theme.
+        """
+        import sys
+        if sys.platform == "darwin":
+            return "black"
+        try:
+            scheme = QGuiApplication.styleHints().colorScheme()
+            if scheme == Qt.ColorScheme.Light:
+                return "black"
+        except Exception:
+            pass
+        return "white"
+
+    def _build_tray_icon(self, prefix: str, color: str) -> QIcon:
+        """Assemble a multi-resolution QIcon from img/{prefix}_{color}_*.png."""
+        base = self._resolve_img_dir()
+        icon = QIcon()
+        for sz in self._TRAY_ICON_SIZES:
+            p = base / f"{prefix}_{color}_{sz}.png"
+            if p.exists():
+                icon.addFile(str(p), QSize(sz, sz))
+        return icon
+
+    def _refresh_tray_icons(self) -> None:
+        """Rebuild idle/running icons (e.g. after a color-scheme change)."""
+        import sys
+        color = self._select_tray_color()
+        self._tray_icon_idle    = self._build_tray_icon("idle",    color)
+        self._tray_icon_running = self._build_tray_icon("running", color)
+        if sys.platform == "darwin":
+            self._tray_icon_idle.setIsMask(True)
+            self._tray_icon_running.setIsMask(True)
+        if self._tray is not None:
+            running = self._session_manager.any_running()
+            self._tray.setIcon(
+                self._tray_icon_running if running else self._tray_icon_idle
+            )
+
+    def _build_tray(self) -> None:
+        self._tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self._tray = QSystemTrayIcon(self)
+        self._tray.setToolTip("PlanFinder")
+        self._refresh_tray_icons()
+
+        # Live-update the icon set when the OS theme flips (Qt 6.5+).
+        try:
+            QGuiApplication.styleHints().colorSchemeChanged.connect(
+                lambda _scheme: self._refresh_tray_icons()
+            )
+        except Exception:
+            pass
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #2d2d2d; color: #ccc; border: 1px solid #444; }"
+            "QMenu::item { padding: 6px 20px; }"
+            "QMenu::item:selected { background: #094771; color: white; }"
+            "QMenu::separator { height: 1px; background: #444; margin: 2px 8px; }"
+        )
+        show_act = menu.addAction("PlanFinder 열기")
+        show_act.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+        quit_act = menu.addAction("종료")
+        quit_act.triggered.connect(self._quit_from_tray)
+        self._tray.setContextMenu(menu)
+
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        # On macOS the menu bar icon mostly fires Trigger; on Windows users
+        # often double-click. Treat both as "toggle window".
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
+        self.close()
+
+    # ------------------------------------------------------------------ #
+    #  Close handling                                                      #
+    # ------------------------------------------------------------------ #
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # If the user explicitly chose Quit (tray menu or app menu) we skip
+        # the prompt. Otherwise consult the saved preference / ask.
+        if not self._force_quit and self._tray is not None:
+            action = self._resolve_close_action()
+            if action == "minimize":
+                self.hide()
+                event.ignore()
+                return
+            if action == "cancel":
+                event.ignore()
+                return
+            # action == "quit" → fall through and tear everything down
+
         self.config_panel.save_settings()
         self.stop_session()
+        if getattr(self, "_tray", None) is not None:
+            self._tray.hide()
         event.accept()
 
-    def _on_session_finished(self, approved: int, rejected: int, pending: int) -> None:
+    def _resolve_close_action(self) -> str:
+        """Return 'minimize' or 'quit'. Asks the user when no preference saved."""
+        s = QSettings()
+        saved = str(s.value("tray/close_action", "") or "")
+        if saved in ("minimize", "quit"):
+            return saved
+        return self._ask_close_action()
+
+    def _ask_close_action(self) -> str:
+        mb = QMessageBox(self)
+        mb.setWindowTitle("PlanFinder 닫기")
+        mb.setIcon(QMessageBox.Icon.Question)
+        mb.setText("창을 어떻게 닫으시겠습니까?")
+        mb.setInformativeText(
+            "트레이로 보내면 작업이 백그라운드에서 계속 실행됩니다.\n"
+            "종료하면 진행 중인 Claude 세션이 모두 중단됩니다."
+        )
+        mb.setStyleSheet(
+            "QMessageBox { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; }"
+            "QPushButton {"
+            "  background: #333; color: #ccc; border: 1px solid #444;"
+            "  border-radius: 4px; padding: 5px 14px; min-width: 80px;"
+            "}"
+            "QPushButton:hover { background: #3d3d3d; }"
+            "QPushButton:default { background: #0e78d5; color: white; border: none; }"
+            "QPushButton:default:hover { background: #1e88e5; }"
+        )
+        minimize_btn = mb.addButton("트레이로 보내기", QMessageBox.ButtonRole.AcceptRole)
+        quit_btn     = mb.addButton("종료",            QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn   = mb.addButton("취소",            QMessageBox.ButtonRole.RejectRole)
+        mb.setDefaultButton(minimize_btn)
+
+        remember = QCheckBox("이 선택을 기억하기")
+        remember.setStyleSheet("QCheckBox { color: #aaa; }")
+        mb.setCheckBox(remember)
+
+        mb.exec()
+        clicked = mb.clickedButton()
+        if clicked is minimize_btn:
+            choice = "minimize"
+        elif clicked is quit_btn:
+            choice = "quit"
+        else:
+            return "cancel"
+
+        if remember.isChecked():
+            QSettings().setValue("tray/close_action", choice)
+        return choice
+
+    def _on_session_finished(
+        self, sid: str, approved: int, rejected: int, pending: int
+    ) -> None:
         parts = [f"✓ {approved} approved", f"✗ {rejected} rejected"]
         if pending:
             parts.append(f"⏳ {pending} pending")
-        self.log_panel.append_log("Session finished: " + ", ".join(parts), "info")
+        self.log_panel.append_log(
+            f"[{sid}] Session finished: " + ", ".join(parts), "info"
+        )
 
     # ------------------------------------------------------------------ #
     #  Signal wiring                                                       #
     # ------------------------------------------------------------------ #
 
-    def _wire_signals(self) -> None:
-        a = self._adapter
+    def _wire_session_signals(self, session: Session) -> None:
+        a = session.adapter
+        sid = session.id
+        prefix = f"[{sid}] "
 
-        a.log_message.connect(self.log_panel.append_log)
-        a.activity_updated.connect(self.log_panel.set_activity)
-        a.iteration_started.connect(self.status_bar_widget.set_iteration)
+        a.log_message.connect(
+            lambda msg, p=prefix: self.log_panel.append_log(p + msg)
+        )
+        a.activity_updated.connect(
+            lambda detail, p=prefix: self.log_panel.set_activity(p + detail)
+        )
+        a.activity_updated.connect(
+            lambda detail, p=prefix: self.log_panel.append_log(
+                f"{p}Claude: {detail}", "dim"
+            )
+        )
+        a.iteration_started.connect(
+            lambda n, sid=sid: self.status_bar_widget.set_iteration_for(sid, n)
+        )
         a.iteration_started.connect(lambda _: self.report_browser.set_running(True))
         a.cost_updated.connect(
-            lambda cost, tokens, turns: (
-                self.status_bar_widget.update_cost(cost, tokens, turns),
-                setattr(self, "_session_cost", cost),
+            lambda cost, tokens, turns: self.status_bar_widget.update_cost(
+                cost, tokens, turns
             )
         )
 
         a.plan_approved.connect(
-            lambda plan, fp: (
+            lambda plan, fp, p=prefix: (
                 self.status_bar_widget.increment_approved(),
-                self.log_panel.append_log(f"Approved: {plan.title}", "success"),
-                self.log_panel.append_log(f"Saved to: {fp}", "dim"),
+                self.log_panel.append_log(f"{p}Approved: {plan.title}", "success"),
+                self.log_panel.append_log(f"{p}Saved to: {fp}", "dim"),
             )
         )
         a.plan_rejected.connect(
-            lambda plan, reason: (
+            lambda plan, reason, p=prefix: (
                 self.status_bar_widget.increment_rejected(),
                 self.log_panel.append_log(
-                    f"Rejected: {plan.title}"
+                    f"{p}Rejected: {plan.title}"
                     + (f" — {reason}" if reason else ""),
                     "reject",
                 ),
             )
         )
         a.plan_pending.connect(
-            lambda plan, fp: (
-                self.log_panel.append_log(f"Pending: {plan.title}", "info"),
-                self.log_panel.append_log(f"Saved to: {fp}", "dim"),
+            lambda plan, fp, p=prefix: (
+                self.log_panel.append_log(f"{p}Pending: {plan.title}", "info"),
+                self.log_panel.append_log(f"{p}Saved to: {fp}", "dim"),
             )
         )
         # Refresh tree shortly after a new plan file is saved
@@ -365,14 +817,17 @@ class MainWindow(QMainWindow):
         )
 
         a.no_more_plans.connect(
-            lambda: self.log_panel.append_log(
-                "No more improvements found. Codebase looks good!", "success"
+            lambda p=prefix: self.log_panel.append_log(
+                f"{p}No more improvements found. Codebase looks good!", "success"
             )
         )
 
-        a.session_finished.connect(self._on_session_finished)
+        a.session_finished.connect(
+            lambda approved, rejected, pending, sid=sid:
+                self._on_session_finished(sid, approved, rejected, pending)
+        )
         a.error_occurred.connect(
-            lambda msg: self.log_panel.append_log(f"Error: {msg}", "error")
+            lambda msg, p=prefix: self.log_panel.append_log(f"{p}Error: {msg}", "error")
         )
 
     # ------------------------------------------------------------------ #
@@ -381,52 +836,68 @@ class MainWindow(QMainWindow):
 
     def _on_resolve_requested(self, paths: list) -> None:
         """Move pending files to working/, then start a resolve session."""
-        report_dir = self._get_report_dir()
-        working_dir = report_dir / "working"
-        working_dir.mkdir(parents=True, exist_ok=True)
+        from ..engine.executor import _show_error
 
-        moved: list[Path] = []
-        for p in paths:
-            orig = Path(p)
-            if orig.exists():
-                dest = working_dir / orig.name
-                orig.rename(dest)
-                moved.append(dest)
-                # Also move any translated versions
-                trans = _find_translated_helper(orig)
-                if trans and trans.exists():
-                    trans.rename(working_dir / trans.name)
+        try:
+            report_dir = self._get_report_dir()
+            working_dir = report_dir / "working"
+            working_dir.mkdir(parents=True, exist_ok=True)
+
+            moved: list[Path] = []
+            for p in paths:
+                orig = Path(p)
+                if orig.exists():
+                    dest = working_dir / orig.name
+                    orig.rename(dest)
+                    moved.append(dest)
+                    # Also move any translated versions
+                    trans = _find_translated_helper(orig)
+                    if trans and trans.exists():
+                        trans.rename(working_dir / trans.name)
+        except Exception as e:
+            _show_error(
+                "pending → working 이동 실패",
+                "파일을 working/ 으로 이동하는 도중 오류가 발생했습니다.",
+                e,
+            )
+            return
 
         self.report_browser.refresh()
 
         if not moved:
             return
 
-        # Stop current session if running
-        self.stop_session()
+        try:
+            config = self.config_panel.get_config()
+            adapter = GuiDisplayAdapter(self)
 
-        config = self.config_panel.get_config()
-        self._adapter = GuiDisplayAdapter(self)
-        self._wire_signals()
+            from ..engine.executor import run_resolve_session
 
-        from ..engine.executor import run_resolve_session
+            label = (
+                f"Resolve · 일괄 {len(moved)}개"
+                if len(moved) > 1
+                else f"Resolve · {moved[0].name}"
+            )
 
-        self._is_resolve_session = True
-        sound_player.start_working_loop()
-
-        coro = run_resolve_session(
-            plan_paths=moved,
-            display=self._adapter,
-            cwd=config["project_dir"],
-            model=config["model"] or None,
-            max_turns=config["max_turns"],
-        )
-        self._task = asyncio.ensure_future(coro)
-        self._task.add_done_callback(self._on_task_done)
-        self.config_panel.start_btn.setEnabled(False)
-        self.config_panel.stop_btn.setEnabled(True)
-        self.report_browser.set_running(True)
-        self.status_bar_widget.set_running(True)
+            coro = run_resolve_session(
+                plan_paths=moved,
+                display=adapter,
+                cwd=config["project_dir"],
+                model=config["model"] or None,
+                max_turns=config["max_turns"],
+            )
+            self._spawn_session(
+                label=label,
+                adapter=adapter,
+                coro=coro,
+                is_resolve=True,
+            )
+        except Exception as e:
+            _show_error(
+                "Resolve 세션 시작 실패",
+                "resolve 세션을 시작하는 도중 오류가 발생했습니다.",
+                e,
+            )
 
     def _on_reject_requested(self, paths: list) -> None:
         """Move pending files to reject/."""
@@ -446,35 +917,41 @@ class MainWindow(QMainWindow):
 
     def _on_restart_requested(self, paths: list) -> None:
         """Files are already in working/; start resolve session directly."""
+        from ..engine.executor import _show_error, run_resolve_session
+
         plan_paths = [Path(p) for p in paths if Path(p).exists()]
         if not plan_paths:
             return
 
-        # Stop current session if running
-        self.stop_session()
+        try:
+            config = self.config_panel.get_config()
+            adapter = GuiDisplayAdapter(self)
 
-        config = self.config_panel.get_config()
-        self._adapter = GuiDisplayAdapter(self)
-        self._wire_signals()
+            label = (
+                f"Restart · 일괄 {len(plan_paths)}개"
+                if len(plan_paths) > 1
+                else f"Restart · {plan_paths[0].name}"
+            )
 
-        from ..engine.executor import run_resolve_session
-
-        self._is_resolve_session = True
-        sound_player.start_working_loop()
-
-        coro = run_resolve_session(
-            plan_paths=plan_paths,
-            display=self._adapter,
-            cwd=config["project_dir"],
-            model=config["model"] or None,
-            max_turns=config["max_turns"],
-        )
-        self._task = asyncio.ensure_future(coro)
-        self._task.add_done_callback(self._on_task_done)
-        self.config_panel.start_btn.setEnabled(False)
-        self.config_panel.stop_btn.setEnabled(True)
-        self.report_browser.set_running(True)
-        self.status_bar_widget.set_running(True)
+            coro = run_resolve_session(
+                plan_paths=plan_paths,
+                display=adapter,
+                cwd=config["project_dir"],
+                model=config["model"] or None,
+                max_turns=config["max_turns"],
+            )
+            self._spawn_session(
+                label=label,
+                adapter=adapter,
+                coro=coro,
+                is_resolve=True,
+            )
+        except Exception as e:
+            _show_error(
+                "Restart 실패",
+                "working/ 에서 다시 시작하는 도중 오류가 발생했습니다.",
+                e,
+            )
 
     def _on_restore_requested(self, paths: list) -> None:
         """Move rejected files back to pending/."""

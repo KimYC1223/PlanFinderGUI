@@ -6,7 +6,7 @@ from pathlib import Path
 from .discovery import discover_plan
 from .display_interface import DisplayInterface
 from .prompts import build_prompt
-from .reporter import save_plan
+from .reporter import save_plan, scan_existing_plans
 from .state import StateManager
 from .throttle import SessionThrottle
 
@@ -160,14 +160,18 @@ async def run_discovery_loop(
             if session_id and resume:
                 display.log(f"Resuming session {session_id[:8]}...")
 
+            existing_plans = scan_existing_plans(report_dir)
+
             if session_id and resume:
                 new_plans = [
                     r for r in state_mgr.state.rejected_plans
                     if r.rejected_at > session_start_time
                 ]
-                prompt = build_prompt(plan_prompt, new_plans)
+                prompt = build_prompt(plan_prompt, new_plans, existing_plans)
             else:
-                prompt = build_prompt(plan_prompt, state_mgr.state.rejected_plans)
+                prompt = build_prompt(
+                    plan_prompt, state_mgr.state.rejected_plans, existing_plans
+                )
 
             resume_id = session_id if resume else None
 

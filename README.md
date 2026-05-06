@@ -2,6 +2,22 @@
 
 Claude AI를 활용해 코드베이스를 자동 분석하고 개선 계획(Plan)을 생성하는 크로스플랫폼 데스크톱 앱입니다.
 
+> ⚠️ **반드시 Claude CLI가 PATH에 설치되어 있어야 합니다.**
+> 이 앱은 내부적으로 `claude` 명령을 실행하므로, CLI가 없으면 동작하지 않습니다.
+> 설치: https://github.com/anthropics/claude-code
+
+## 다운로드 (Release 바이너리)
+
+빌드된 바이너리는 [GitHub Releases](../../releases) 페이지에서 받을 수 있습니다.
+
+- **macOS**: `PlanFinder-macOS.zip` — 압축 해제 후 `PlanFinder.app` 실행
+  서명되지 않은 빌드라 첫 실행 시 macOS가 막을 수 있습니다. 우클릭 → 열기, 또는:
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/PlanFinder.app
+  ```
+- **Windows**: `PlanFinder-Windows.zip` — 압축 해제 후 `PlanFinder\PlanFinder.exe` 실행
+  SmartScreen 경고가 뜨면 "추가 정보" → "실행"을 클릭하세요.
+
 ## 주요 기능
 
 - **자동 분석**: 프로젝트 디렉터리를 지정하면 Claude가 반복적으로 코드를 탐색해 버그, 개선점, 리팩터링 대상을 찾아냅니다
@@ -31,15 +47,32 @@ uv run plan-finder-gui
 
 ## 빌드 (PyInstaller)
 
-macOS `.app` 또는 Windows `.exe`로 패키징합니다.
+현재 OS용 바이너리를 로컬에서 빌드합니다. **PyInstaller는 크로스 컴파일을 지원하지 않으므로**, Mac에서는 `.app`만, Windows에서는 `.exe`만 만들 수 있습니다.
 
 ```bash
-bash build.sh
+bash build.sh        # macOS / Linux
+```
+
+```powershell
+# Windows (PowerShell)
+uv sync --extra build
+uv run pyinstaller plan_finder_gui.spec --noconfirm
 ```
 
 빌드 결과물:
 - macOS: `dist/PlanFinder.app`
 - Windows: `dist/PlanFinder/PlanFinder.exe`
+
+## Release 배포 (GitHub Actions)
+
+`v`로 시작하는 git 태그를 푸시하면 `.github/workflows/release.yml`이 macOS/Windows 바이너리를 자동으로 빌드해 GitHub Release에 업로드합니다.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Actions 탭에서 빌드 진행 상황을 확인할 수 있고, 완료되면 Releases 페이지에 zip 파일이 첨부됩니다.
 
 ## 리포트 구조
 

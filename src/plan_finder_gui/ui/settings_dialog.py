@@ -10,9 +10,14 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -234,6 +239,210 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(sys_group)
 
+        # ── Claude CLI ───────────────────────────────────────────────────
+        cli_group = QGroupBox("Claude CLI")
+        cli_group.setStyleSheet(_GROUP_SS)
+        cli_inner = QVBoxLayout(cli_group)
+        cli_inner.setContentsMargins(8, 8, 8, 8)
+        cli_inner.setSpacing(6)
+
+        cli_row = QHBoxLayout()
+        cli_row.setSpacing(4)
+        self._cli_path_edit = QLineEdit()
+        self._cli_path_edit.setPlaceholderText("기본값: PATH에서 자동 탐색")
+        self._cli_path_edit.setStyleSheet(
+            "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
+            "border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
+            "QLineEdit:focus { border-color: #0e78d5; }"
+        )
+
+        cli_browse_btn = QPushButton("…")
+        cli_browse_btn.setFixedWidth(28)
+        cli_browse_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; border-radius: 3px; }"
+            "QPushButton:hover { background: #444; }"
+        )
+        cli_browse_btn.clicked.connect(self._browse_cli_path)
+        cli_row.addWidget(self._cli_path_edit)
+        cli_row.addWidget(cli_browse_btn)
+
+        cli_note = QLabel("nvm 등으로 설치한 경우 경로를 직접 지정하세요.")
+        cli_note.setStyleSheet(_DIM_SS)
+        cli_note.setWordWrap(True)
+
+        cli_inner.addLayout(cli_row)
+        cli_inner.addWidget(cli_note)
+        layout.addWidget(cli_group)
+
+        # ── 프리셋 ───────────────────────────────────────────────────────
+        preset_group = QGroupBox("프리셋")
+        preset_group.setStyleSheet(_GROUP_SS)
+        preset_inner = QVBoxLayout(preset_group)
+        preset_inner.setContentsMargins(8, 8, 8, 8)
+        preset_inner.setSpacing(6)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        self._preset_dir_edit = QLineEdit()
+        self._preset_dir_edit.setPlaceholderText("프리셋 .md 파일이 있는 디렉토리")
+        self._preset_dir_edit.setStyleSheet(
+            "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
+            "border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
+            "QLineEdit:focus { border-color: #0e78d5; }"
+        )
+        preset_browse_btn = QPushButton("…")
+        preset_browse_btn.setFixedWidth(28)
+        preset_browse_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; border-radius: 3px; }"
+            "QPushButton:hover { background: #444; }"
+        )
+        preset_browse_btn.clicked.connect(self._browse_preset_dir)
+        preset_row.addWidget(self._preset_dir_edit)
+        preset_row.addWidget(preset_browse_btn)
+
+        preset_note = QLabel(
+            "이 디렉토리의 .md 파일이 프롬프트 프리셋 드롭다운에 추가됩니다.\n"
+            "포맷: # 제목 / ## Description / ## Tags / ## Prompt (Prompt 섹션이 없으면 파일 전체를 프롬프트로 사용)."
+        )
+        preset_note.setStyleSheet(_DIM_SS)
+        preset_note.setWordWrap(True)
+
+        preset_inner.addLayout(preset_row)
+        preset_inner.addWidget(preset_note)
+        layout.addWidget(preset_group)
+
+        # ── Git ──────────────────────────────────────────────────────────
+        git_group = QGroupBox("Git")
+        git_group.setStyleSheet(_GROUP_SS)
+        git_inner = QVBoxLayout(git_group)
+        git_inner.setContentsMargins(8, 8, 8, 8)
+        git_inner.setSpacing(8)
+
+        self._batch_resolve_check = QCheckBox(
+            "체크된 Plan들을 한 Claude 세션에서 일괄 Resolve"
+        )
+        self._batch_resolve_check.setStyleSheet(_CHECK_SS)
+        git_inner.addWidget(self._batch_resolve_check)
+
+        batch_note = QLabel(
+            "여러 Plan을 동시에 Resolve/Restart할 때 파일마다 세션을 새로 띄우지 않고 "
+            "하나의 세션에서 한꺼번에 처리합니다. 자동 커밋이 켜져 있으면 커밋도 한 번만 생성됩니다."
+        )
+        batch_note.setStyleSheet(_DIM_SS)
+        batch_note.setWordWrap(True)
+        git_inner.addWidget(batch_note)
+
+        self._auto_commit_check = QCheckBox("Resolve Plan 완료 후 자동 커밋")
+        self._auto_commit_check.setStyleSheet(_CHECK_SS)
+        git_inner.addWidget(self._auto_commit_check)
+
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(8)
+        lang_lbl = QLabel("작업 언어")
+        lang_lbl.setStyleSheet(_LABEL_SS)
+
+        from PySide6.QtWidgets import QComboBox
+        self._work_lang_combo = QComboBox()
+        self._work_lang_combo.addItem("한국어", "ko")
+        self._work_lang_combo.addItem("English", "en")
+        self._work_lang_combo.setStyleSheet(
+            "QComboBox { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
+            "border-radius: 4px; padding: 2px 6px; font-size: 12px; }"
+            "QComboBox::drop-down { border: none; width: 0px; }"
+            "QComboBox QAbstractItemView { background: #2d2d2d; color: #ccc; }"
+        )
+
+        lang_row.addWidget(lang_lbl)
+        lang_row.addWidget(self._work_lang_combo, stretch=1)
+        git_inner.addLayout(lang_row)
+
+        lang_note = QLabel("Claude가 커밋 메시지나 주석을 달 때 사용할 언어입니다.")
+        lang_note.setStyleSheet(_DIM_SS)
+        lang_note.setWordWrap(True)
+        git_inner.addWidget(lang_note)
+
+        layout.addWidget(git_group)
+
+        # ── ccusage ─────────────────────────────────────────────────────
+        from .ccusage_install_dialog import is_ccusage_installed
+
+        cc_group = QGroupBox("ccusage")
+        cc_group.setStyleSheet(_GROUP_SS)
+        cc_inner = QVBoxLayout(cc_group)
+        cc_inner.setContentsMargins(8, 8, 8, 8)
+        cc_inner.setSpacing(6)
+
+        self._cc_status = QLabel()
+        self._cc_status.setStyleSheet(_LABEL_SS)
+        self._cc_status.setWordWrap(True)
+
+        cc_btn_row = QHBoxLayout()
+        cc_btn_row.setSpacing(6)
+        self._cc_install_btn = QPushButton("설치 안내 열기")
+        self._cc_install_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; border-radius: 4px;"
+            "  font-size: 12px; padding: 4px 10px; border: 1px solid #444; }"
+            "QPushButton:hover { background: #444; }"
+        )
+        self._cc_install_btn.clicked.connect(self._open_ccusage_dialog)
+        cc_btn_row.addWidget(self._cc_install_btn)
+        cc_btn_row.addStretch(1)
+
+        cc_inner.addWidget(self._cc_status)
+        cc_inner.addLayout(cc_btn_row)
+        layout.addWidget(cc_group)
+
+        self._refresh_ccusage_status()
+
+        # ── 팀원 ────────────────────────────────────────────────────────
+        team_group = QGroupBox("팀원")
+        team_group.setStyleSheet(_GROUP_SS)
+        team_inner = QVBoxLayout(team_group)
+        team_inner.setContentsMargins(8, 8, 8, 8)
+        team_inner.setSpacing(6)
+
+        my_row = QHBoxLayout()
+        my_row.setSpacing(8)
+        my_lbl = QLabel("본인 이름")
+        my_lbl.setStyleSheet(_LABEL_SS)
+        my_lbl.setFixedWidth(70)
+        self._my_name_edit = QLineEdit()
+        self._my_name_edit.setPlaceholderText("예: youngchan")
+        self._my_name_edit.setStyleSheet(
+            "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
+            "border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
+            "QLineEdit:focus { border-color: #0e78d5; }"
+        )
+        my_row.addWidget(my_lbl)
+        my_row.addWidget(self._my_name_edit, stretch=1)
+        team_inner.addLayout(my_row)
+
+        members_lbl = QLabel("팀원 이름 (한 줄에 한 명)")
+        members_lbl.setStyleSheet(_LABEL_SS)
+        team_inner.addWidget(members_lbl)
+
+        self._team_members_edit = QPlainTextEdit()
+        self._team_members_edit.setPlaceholderText("alice\nbob\ncharlie")
+        self._team_members_edit.setFixedHeight(80)
+        self._team_members_edit.setStyleSheet(
+            "QPlainTextEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
+            "border-radius: 4px; padding: 4px 6px; font-size: 12px; }"
+            "QPlainTextEdit:focus { border-color: #0e78d5; }"
+        )
+        team_inner.addWidget(self._team_members_edit)
+
+        team_warn = QLabel(
+            "⚠ 팀원 목록에 본인 이름을 넣으면 안 됩니다. "
+            "본인은 위 '본인 이름' 칸에만 적어주세요."
+        )
+        team_warn.setStyleSheet(
+            "color: #ffb74d; font-size: 11px; background: transparent;"
+        )
+        team_warn.setWordWrap(True)
+        team_inner.addWidget(team_warn)
+
+        layout.addWidget(team_group)
+
         # ── 버튼 ────────────────────────────────────────────────────────
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -258,6 +467,24 @@ class SettingsDialog(QDialog):
         self._slider.setValue(volume)
         self._vol_pct.setText(f"{volume}%")
         self._autolaunch_check.setChecked(is_auto_launch_enabled())
+        self._cli_path_edit.setText(s.value("claude_cli_path", ""))
+        self._preset_dir_edit.setText(s.value("preset_dir", ""))
+
+        auto_commit = s.value("auto_commit", False)
+        self._auto_commit_check.setChecked(auto_commit in (True, "true", "True", "1"))
+
+        batch_resolve = s.value("batch_resolve", False)
+        self._batch_resolve_check.setChecked(batch_resolve in (True, "true", "True", "1"))
+
+        work_lang = s.value("work_lang", s.value("commit_lang", "ko")) or "ko"
+        idx = self._work_lang_combo.findData(work_lang)
+        if idx >= 0:
+            self._work_lang_combo.setCurrentIndex(idx)
+
+        my_name = str(s.value("team/my_name", "") or "")
+        members_raw = str(s.value("team/members", "") or "")
+        self._my_name_edit.setText(my_name)
+        self._team_members_edit.setPlainText(members_raw)
 
     def _on_volume_changed(self, value: int) -> None:
         self._vol_pct.setText(f"{value}%")
@@ -266,16 +493,88 @@ class SettingsDialog(QDialog):
     def _preview_sound(self) -> None:
         sound_player.play("button.wav")
 
+    def _refresh_ccusage_status(self) -> None:
+        from .ccusage_install_dialog import is_ccusage_installed
+
+        if is_ccusage_installed():
+            self._cc_status.setText("✓ ccusage 설치됨")
+            self._cc_status.setStyleSheet(
+                "color: #4caf50; font-size: 12px; background: transparent;"
+            )
+        else:
+            self._cc_status.setText("✗ ccusage 미설치 — 예산 Throttle/세션 모니터링에 필요")
+            self._cc_status.setStyleSheet(
+                "color: #d39c2a; font-size: 12px; background: transparent;"
+            )
+
+    def _open_ccusage_dialog(self) -> None:
+        from .ccusage_install_dialog import CcusageInstallDialog
+
+        s = QSettings()
+        dlg = CcusageInstallDialog(self)
+        dlg.exec()
+        if dlg.dont_ask_again():
+            s.setValue("ccusage/skip_install_prompt", True)
+        else:
+            s.setValue("ccusage/skip_install_prompt", False)
+        self._refresh_ccusage_status()
+
+    def _browse_cli_path(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Claude CLI 실행 파일 선택", self._cli_path_edit.text() or ""
+        )
+        if path:
+            self._cli_path_edit.setText(path)
+
+    def _browse_preset_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "프리셋 디렉토리 선택", self._preset_dir_edit.text() or ""
+        )
+        if path:
+            self._preset_dir_edit.setText(path)
+
     def _save_and_accept(self) -> None:
+        my_name = self._my_name_edit.text().strip()
+        members = _parse_team_members(self._team_members_edit.toPlainText())
+
+        if my_name and my_name in members:
+            QMessageBox.warning(
+                self,
+                "팀원 이름 오류",
+                f"'{my_name}'은(는) 본인 이름입니다. "
+                f"팀원 목록에서 제거해 주세요.\n\n"
+                f"본인은 '본인 이름' 칸에만 적어야 합니다.",
+            )
+            return
+
         s = QSettings()
         s.setValue("sound_volume", self._slider.value())
+        s.setValue("claude_cli_path", self._cli_path_edit.text().strip())
+        s.setValue("preset_dir", self._preset_dir_edit.text().strip())
+        s.setValue("auto_commit", self._auto_commit_check.isChecked())
+        s.setValue("batch_resolve", self._batch_resolve_check.isChecked())
+        s.setValue("work_lang", self._work_lang_combo.currentData())
+        s.setValue("team/my_name", my_name)
+        s.setValue("team/members", "\n".join(members))
         try:
             set_auto_launch(self._autolaunch_check.isChecked())
         except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self,
                 "자동 실행 설정 실패",
                 f"자동 실행 설정 중 오류가 발생했습니다:\n{e}",
             )
         self.accept()
+
+
+def _parse_team_members(raw: str) -> list[str]:
+    """Parse the team members textarea into a deduped, ordered list."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        name = line.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out

@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -31,10 +32,10 @@ class _Worker(QObject):
         # ── ccusage: all blocks ─────────────────────────────────────────────
         try:
             proc = subprocess.run(
-                ["ccusage", "blocks", "--json"],
+                ["ccusage", "blocks", "--json", "--recent", "--offline"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=60,
             )
             if proc.returncode == 0:
                 data = json.loads(proc.stdout)
@@ -112,6 +113,7 @@ class ClaudeSessionPanel(QWidget):
         self._worker.data_ready.connect(self._on_data)
         self._fetching = False
 
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._build_ui()
 
         self._timer = QTimer(self)
@@ -136,6 +138,7 @@ class ClaudeSessionPanel(QWidget):
             "}"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; top: -1px; }"
         )
+        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         inner = QVBoxLayout(group)
         inner.setContentsMargins(8, 6, 8, 6)
         inner.setSpacing(2)
@@ -144,7 +147,7 @@ class ClaudeSessionPanel(QWidget):
         val_style = "color: #ccc; font-size: 11px; background: transparent;"
         dim_style = "color: #666; font-size: 10px; background: transparent;"
 
-        self._account_lbl = QLabel("계정: —")
+        self._account_lbl = QLabel("계정: 로딩 중...")
         self._account_lbl.setStyleSheet(val_style)
         inner.addWidget(self._account_lbl)
 
@@ -157,15 +160,15 @@ class ClaudeSessionPanel(QWidget):
         self._sess_header.setStyleSheet(lbl_style)
         inner.addWidget(self._sess_header)
 
-        self._sess_time = QLabel("  시간: —")
+        self._sess_time = QLabel("  로딩 중...")
         self._sess_time.setStyleSheet(dim_style)
         inner.addWidget(self._sess_time)
 
-        self._sess_cost = QLabel("  비용: —")
+        self._sess_cost = QLabel("")
         self._sess_cost.setStyleSheet(dim_style)
         inner.addWidget(self._sess_cost)
 
-        self._sess_model = QLabel("  모델: —")
+        self._sess_model = QLabel("")
         self._sess_model.setStyleSheet(dim_style)
         self._sess_model.setWordWrap(True)
         inner.addWidget(self._sess_model)
@@ -179,13 +182,15 @@ class ClaudeSessionPanel(QWidget):
         self._today_header.setStyleSheet(lbl_style)
         inner.addWidget(self._today_header)
 
-        self._today_cost = QLabel("  비용: —")
+        self._today_cost = QLabel("  로딩 중...")
         self._today_cost.setStyleSheet(dim_style)
         inner.addWidget(self._today_cost)
 
-        self._today_tokens = QLabel("  토큰: —")
+        self._today_tokens = QLabel("")
         self._today_tokens.setStyleSheet(dim_style)
         inner.addWidget(self._today_tokens)
+
+        inner.addStretch()
 
         outer.addWidget(group)
 
@@ -196,6 +201,19 @@ class ClaudeSessionPanel(QWidget):
             return
         self._fetching = True
         self._worker.fetch()
+
+    def showEvent(self, event):  # type: ignore[override]
+        # Resume polling whenever the panel becomes visible.
+        if not self._timer.isActive():
+            self._timer.start()
+            self._refresh()
+        super().showEvent(event)
+
+    def hideEvent(self, event):  # type: ignore[override]
+        # Pause ccusage polling while hidden — no point spawning a subprocess
+        # every 2s when nobody can see the result.
+        self._timer.stop()
+        super().hideEvent(event)
 
     def _on_data(self, result: dict) -> None:
         self._fetching = False

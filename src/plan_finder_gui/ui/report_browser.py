@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QUrl, Signal
 from . import sound_player
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTextBrowser,
     QTreeWidget,
@@ -272,6 +282,8 @@ class ReportBrowser(QWidget):
         self._report_dir: Path | None = None
         self._is_running: bool = False
         self._current_file: Path | None = None   # original path of displayed file
+        self._viewing_original: bool = False     # True → showing original even when translation exists
+        self._suppress_click_deselect: bool = False  # set when itemChanged just previewed; itemClicked must not undo it
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -327,6 +339,8 @@ class ReportBrowser(QWidget):
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        # Watch for clicks on empty area (no item under cursor) to deselect.
+        self._tree.viewport().installEventFilter(self)
         left_layout.addWidget(self._tree, stretch=1)
 
         # Button bar
@@ -356,7 +370,12 @@ class ReportBrowser(QWidget):
 
         splitter.addWidget(left_widget)
 
-        # ---- Right: markdown viewer ----
+        # ---- Right: markdown viewer + view-mode toggle bar ----
+        self._right_widget = QWidget()
+        right_layout = QVBoxLayout(self._right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
         self._viewer = QTextBrowser()
         self._viewer.setOpenExternalLinks(True)
         self._viewer.setWordWrapMode(
@@ -373,8 +392,23 @@ class ReportBrowser(QWidget):
         )
         self._viewer.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._viewer.customContextMenuRequested.connect(self._on_viewer_context_menu)
-        self._viewer.setVisible(False)
-        splitter.addWidget(self._viewer)
+        right_layout.addWidget(self._viewer, stretch=1)
+
+        # Toggle view button bar (translated <-> original)
+        self._viewer_btn_bar = QWidget()
+        self._viewer_btn_bar.setStyleSheet("background: #252526; border-top: 1px solid #333;")
+        viewer_btn_layout = QHBoxLayout(self._viewer_btn_bar)
+        viewer_btn_layout.setContentsMargins(8, 6, 8, 6)
+        viewer_btn_layout.setSpacing(6)
+        viewer_btn_layout.addStretch()
+        self._toggle_view_btn = _action_btn("🌐  원문보기", "#00695c", "#00897b")
+        self._toggle_view_btn.clicked.connect(self._on_toggle_view)
+        viewer_btn_layout.addWidget(self._toggle_view_btn)
+        self._viewer_btn_bar.setVisible(False)
+        right_layout.addWidget(self._viewer_btn_bar)
+
+        self._right_widget.setVisible(False)
+        splitter.addWidget(self._right_widget)
         splitter.setSizes([1, 0])
         root.addWidget(splitter, stretch=1)
 
@@ -403,6 +437,12 @@ class ReportBrowser(QWidget):
                     key=lambda f: f.name,
                 )
 
+            # Group files by keyword (files without one fall under "Unassigned").
+            by_keyword: dict[str, list[Path]] = {}
+            for f in files:
+                kw = _extract_keyword(f) or "Unassigned"
+                by_keyword.setdefault(kw, []).append(f)
+
             color = _CATEGORY_COLORS.get(cat, "#ccc")
             bg    = _CATEGORY_BG.get(cat, "#2a2a2a")
             label = _CATEGORY_LABELS.get(cat, cat)
@@ -411,13 +451,28 @@ class ReportBrowser(QWidget):
             folder_item.setForeground(0, QColor(color))
             folder_item.setBackground(0, QColor(bg))
 
-            for f in files:
-                name = _display_name(f)
-                file_item = QTreeWidgetItem([f"    {name}"])
-                file_item.setCheckState(0, Qt.CheckState.Unchecked)
-                file_item.setData(0, Qt.ItemDataRole.UserRole, ("file", str(f), cat))
-                file_item.setForeground(0, QColor("#cccccc"))
-                folder_item.addChild(file_item)
+            # Sort keywords alphabetically; "Unassigned" goes last.
+            sorted_keywords = sorted(
+                by_keyword.keys(),
+                key=lambda k: (k == "Unassigned", k.lower()),
+            )
+            for kw in sorted_keywords:
+                kw_files = by_keyword[kw]
+                kw_item = QTreeWidgetItem([f"  {kw}  ({len(kw_files)})"])
+                kw_item.setData(0, Qt.ItemDataRole.UserRole, ("keyword", cat, kw))
+                kw_item.setForeground(0, QColor("#9aa0a6"))
+                folder_item.addChild(kw_item)
+
+                for f in kw_files:
+                    name = _display_name(f)
+                    file_item = QTreeWidgetItem([f"  {name}"])
+                    file_item.setCheckState(0, Qt.CheckState.Unchecked)
+                    file_item.setData(0, Qt.ItemDataRole.UserRole, ("file", str(f), cat))
+                    file_item.setForeground(0, QColor("#cccccc"))
+                    kw_item.addChild(file_item)
+
+                # Keyword sub-folders are expanded so files are visible at a glance.
+                kw_item.setExpanded(True)
 
             self._tree.addTopLevelItem(folder_item)
             # pending is expanded by default; others collapsed
@@ -435,7 +490,24 @@ class ReportBrowser(QWidget):
     #  Tree interaction                                                    #
     # ------------------------------------------------------------------ #
 
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        # Click on tree's empty area (no item under cursor) → deselect.
+        if (
+            obj is self._tree.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and self._tree.itemAt(event.position().toPoint()) is None
+        ):
+            self._deselect_file()
+            self._tree.clearSelection()
+        return super().eventFilter(obj, event)
+
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # If a checkbox toggle just previewed this item, don't let the
+        # accompanying itemClicked deselect it.
+        if self._suppress_click_deselect:
+            self._suppress_click_deselect = False
+            return
+
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data and data[0] == "file":
             path = Path(data[1])
@@ -445,38 +517,74 @@ class ReportBrowser(QWidget):
                 self._tree.clearSelection()
             else:
                 self._show_file(path)
-        elif data and data[0] == "folder":
-            # Folder clicked → deselect any open file
+        elif data and data[0] in ("folder", "keyword"):
+            # Category or keyword folder clicked → deselect any open file
             self._deselect_file()
+            self._tree.clearSelection()
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        # A checkbox flip (check OR uncheck) counts as selecting that file:
+        # show its preview. Bulk select-all/deselect-all paths block tree
+        # signals, so this only fires for genuine single-item toggles.
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data and data[0] == "file":
+            self._tree.setCurrentItem(item)
+            self._show_file(Path(data[1]))
+            self._suppress_click_deselect = True
         self._update_buttons()
 
     def _deselect_file(self) -> None:
         self._current_file = None
-        self._viewer.setVisible(False)
+        self._viewing_original = False
+        self._right_widget.setVisible(False)
 
     def _show_file(self, original: Path) -> None:
-        was_hidden = not self._viewer.isVisible()
+        was_hidden = not self._right_widget.isVisible()
+        # Reset to translated-by-default when navigating to a different file
+        if original != self._current_file:
+            self._viewing_original = False
         self._current_file = original
         if was_hidden:
-            self._viewer.setVisible(True)
+            self._right_widget.setVisible(True)
             self._splitter.setSizes([280, 720])
         translated = _find_translated(original)
-        target = translated if (translated and translated.exists()) else original
+        if translated and translated.exists() and not self._viewing_original:
+            target = translated
+        else:
+            target = original
         if not target.exists():
             self._viewer.setPlainText("파일을 찾을 수 없습니다.")
+            self._update_toggle_button(translated)
             return
         try:
             content = target.read_text(encoding="utf-8")
         except Exception as e:
             self._viewer.setPlainText(f"파일 읽기 오류: {e}")
+            self._update_toggle_button(translated)
             return
         try:
             self._viewer.setHtml(_build_viewer_html(content))
         except ImportError:
             # markdown library not installed — use Qt's built-in renderer
             self._viewer.setMarkdown(content)
+        self._update_toggle_button(translated)
+
+    def _update_toggle_button(self, translated: Path | None) -> None:
+        """Show toggle button only when a translation exists; label depends on view mode."""
+        has_translation = translated is not None and translated.exists()
+        self._viewer_btn_bar.setVisible(has_translation)
+        if not has_translation:
+            return
+        if self._viewing_original:
+            self._toggle_view_btn.setText("🌐  번역보기")
+        else:
+            self._toggle_view_btn.setText("🌐  원문보기")
+
+    def _on_toggle_view(self) -> None:
+        if not self._current_file:
+            return
+        self._viewing_original = not self._viewing_original
+        self._show_file(self._current_file)
 
     def _on_viewer_context_menu(self, pos: QPoint) -> None:
         if not self._current_file:
@@ -495,11 +603,23 @@ class ReportBrowser(QWidget):
             file_path = Path(data[1])
             self._show_file(file_path)
             self._show_file_context_menu(file_path, self._tree.mapToGlobal(pos))
-        elif data[0] == "folder":
+        elif data[0] in ("folder", "keyword"):
             self._show_folder_context_menu(item, self._tree.mapToGlobal(pos))
 
     def _show_folder_context_menu(self, folder_item: QTreeWidgetItem, global_pos: QPoint) -> None:
-        if folder_item.childCount() == 0:
+        fdata = folder_item.data(0, Qt.ItemDataRole.UserRole)
+        if not fdata or fdata[0] not in ("folder", "keyword"):
+            return
+        is_category = fdata[0] == "folder"
+        cat = fdata[1]  # category name for both folder and keyword nodes
+
+        # Walk descendants once — context menu actions operate on every file
+        # under this node (one level for keyword, two for category).
+        file_descendants: list[tuple[QTreeWidgetItem, Path]] = list(
+            _iter_file_descendants(folder_item)
+        )
+
+        if not file_descendants and not (is_category and cat == "pending"):
             return
 
         menu = QMenu(self)
@@ -507,22 +627,65 @@ class ReportBrowser(QWidget):
             "QMenu { background: #2d2d2d; color: #ccc; border: 1px solid #444; }"
             "QMenu::item { padding: 6px 20px; }"
             "QMenu::item:selected { background: #094771; color: white; }"
+            "QMenu::separator { height: 1px; background: #444; margin: 2px 8px; }"
         )
 
-        select_all_act   = menu.addAction("전체 선택")
-        deselect_all_act = menu.addAction("전체 선택 해제")
+        select_all_act = None
+        deselect_all_act = None
+        if file_descendants:
+            select_all_act   = menu.addAction("전체 선택")
+            deselect_all_act = menu.addAction("전체 선택 해제")
+
+        untranslated_files: list[Path] = [
+            fp for _, fp in file_descendants
+            if not _is_translated(fp) and _find_translated(fp) is None
+        ]
+
+        translate_all_act = None
+        if untranslated_files:
+            menu.addSeparator()
+            translate_all_act = menu.addAction(f"번역 안된 파일 전체 번역하기 ({len(untranslated_files)}개)")
+
+        distribute_act = None
+        if is_category and cat == "pending":
+            menu.addSeparator()
+            n_pending = len(file_descendants)
+            label = "팀원과 분배하기"
+            if n_pending:
+                label = f"팀원과 분배하기 ({n_pending}개)"
+            distribute_act = menu.addAction(label)
+            if n_pending == 0:
+                distribute_act.setEnabled(False)
 
         chosen = menu.exec(global_pos)
 
+        toggled: list[QTreeWidgetItem] = []
         self._tree.blockSignals(True)
-        if chosen == select_all_act:
-            for i in range(folder_item.childCount()):
-                folder_item.child(i).setCheckState(0, Qt.CheckState.Checked)
-        elif chosen == deselect_all_act:
-            for i in range(folder_item.childCount()):
-                folder_item.child(i).setCheckState(0, Qt.CheckState.Unchecked)
+        if select_all_act is not None and chosen == select_all_act:
+            for child, _ in file_descendants:
+                if child.checkState(0) != Qt.CheckState.Checked:
+                    child.setCheckState(0, Qt.CheckState.Checked)
+                    toggled.append(child)
+        elif deselect_all_act is not None and chosen == deselect_all_act:
+            for child, _ in file_descendants:
+                if child.checkState(0) != Qt.CheckState.Unchecked:
+                    child.setCheckState(0, Qt.CheckState.Unchecked)
+                    toggled.append(child)
         self._tree.blockSignals(False)
         self._update_buttons()
+
+        # Bulk select touching exactly one item still counts as a single
+        # selection — preview it. Two or more is treated as no selection.
+        if len(toggled) == 1:
+            data = toggled[0].data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "file":
+                self._tree.setCurrentItem(toggled[0])
+                self._show_file(Path(data[1]))
+
+        if translate_all_act is not None and chosen == translate_all_act:
+            self._translate_all_files(untranslated_files)
+        elif distribute_act is not None and chosen == distribute_act:
+            self._distribute_to_team(folder_item)
 
     def _show_file_context_menu(self, path: Path, global_pos: QPoint) -> None:
         menu = QMenu(self)
@@ -632,6 +795,290 @@ class ReportBrowser(QWidget):
         if self._current_file == path:
             self._show_file(path)
 
+    def _translate_all_files(self, files: list[Path]) -> None:
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import (
+            QApplication, QComboBox, QDialog, QDialogButtonBox,
+            QLabel, QMessageBox, QVBoxLayout,
+        )
+        from ..engine.translator import save_translated, translate_with_claude, translate_with_google
+
+        settings = QSettings()
+        saved_method = str(settings.value("translate_method", "Google Translate API"))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("번역 안된 파일 전체 번역하기")
+        dialog.setFixedWidth(300)
+        dialog.setStyleSheet(
+            "QDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; font-size: 12px; }"
+            "QComboBox {"
+            "  background: #3c3c3c; color: #ccc;"
+            "  border: 1px solid #555; padding: 4px 8px;"
+            "}"
+            "QComboBox QAbstractItemView { background: #3c3c3c; color: #ccc; }"
+            "QPushButton {"
+            "  background: #0e639c; color: white;"
+            "  border: none; padding: 6px 16px;"
+            "}"
+            "QPushButton:hover { background: #1177bb; }"
+        )
+        dlg_layout = QVBoxLayout(dialog)
+        dlg_layout.setSpacing(10)
+        dlg_layout.setContentsMargins(16, 16, 16, 16)
+        dlg_layout.addWidget(QLabel(f"번역 안된 파일 {len(files)}개를 번역합니다.\n번역 방법을 선택하세요:"))
+        combo = QComboBox()
+        combo.addItems(["Google Translate API", "Claude"])
+        idx = combo.findText(saved_method)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        dlg_layout.addWidget(combo)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        method = combo.currentText()
+        settings.setValue("translate_method", method)
+
+        if "Google" in method:
+            from .google_auth_dialog import GoogleAuthDialog
+            if not GoogleAuthDialog.ensure_credentials(self):
+                return
+
+        errors: list[str] = []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        for path in files:
+            try:
+                content = path.read_text(encoding="utf-8")
+                if "Google" in method:
+                    translated_text = translate_with_google(content)
+                else:
+                    translated_text = translate_with_claude(content)
+                save_translated(path, translated_text)
+                if self._current_file == path:
+                    self._show_file(path)
+            except Exception as e:
+                errors.append(f"{path.name}: {e}")
+        QApplication.restoreOverrideCursor()
+
+        if errors:
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            QMessageBox.warning(
+                self,
+                "번역 일부 실패",
+                f"다음 파일 번역 중 오류가 발생했습니다:\n\n" + "\n".join(errors),
+            )
+        else:
+            sound_player.play("trescue.wav")
+
+    # ------------------------------------------------------------------ #
+    #  Team distribution                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _distribute_to_team(self, folder_item: QTreeWidgetItem) -> None:
+        """Distribute pending plans to team members by keyword.
+
+        Flow:
+          1. Validate team settings (alert / force-open settings).
+          2. Extract unique keywords from pending plans.
+          3. Ask the user to assign each keyword to a member.
+          4. Copy files into ~/Desktop/claude-reports/<project>/<member>/
+             (translated versions go into translated/ subdir).
+          5. Zip each member's folder, then delete the unzipped folder.
+          6. Move non-self plans from pending → reviewed.
+        """
+        if self._report_dir is None:
+            return
+
+        pending_files: list[Path] = [
+            fp for _, fp in _iter_file_descendants(folder_item)
+            if fp.exists() and not _is_translated(fp)
+        ]
+
+        if not pending_files:
+            QMessageBox.information(
+                self, "분배할 파일 없음", "Pending 폴더에 분배할 파일이 없습니다."
+            )
+            return
+
+        # 1. Validate team settings.
+        s = QSettings()
+        my_name = str(s.value("team/my_name", "") or "").strip()
+        members = _read_team_members(s)
+
+        my_empty = not my_name
+        team_empty = not members
+
+        if my_empty and team_empty:
+            QMessageBox.warning(
+                self,
+                "팀원 설정이 비어있습니다",
+                "본인 이름과 팀원 목록이 모두 비어있어 분배할 수 없습니다.\n"
+                "설정 창을 열어 입력해주세요.",
+            )
+            self._open_settings_dialog()
+            # Reload after settings dialog closes.
+            s = QSettings()
+            my_name = str(s.value("team/my_name", "") or "").strip()
+            members = _read_team_members(s)
+            if not my_name and not members:
+                return
+        elif my_empty or team_empty:
+            missing = "본인 이름" if my_empty else "팀원 목록"
+            reply = QMessageBox.question(
+                self,
+                "확인",
+                f"{missing}이(가) 비어있습니다. 이대로 진행하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if my_name and my_name in members:
+            QMessageBox.warning(
+                self,
+                "팀원 설정 오류",
+                f"'{my_name}'은(는) 본인 이름이지만 팀원 목록에도 있습니다. "
+                f"설정 창에서 팀원 목록을 수정해주세요.",
+            )
+            return
+
+        candidates: list[str] = []
+        if my_name:
+            candidates.append(my_name)
+        candidates.extend(m for m in members if m != my_name)
+        if not candidates:
+            return
+
+        # 2. Build keyword → list[file] map.
+        keyword_files: dict[str, list[Path]] = {}
+        for fp in pending_files:
+            kw = _extract_keyword(fp) or "Unassigned"
+            keyword_files.setdefault(kw, []).append(fp)
+
+        # 3. Ask user to assign each keyword to a candidate.
+        dlg = _KeywordAssignmentDialog(
+            keywords=sorted(keyword_files.keys()),
+            candidates=candidates,
+            my_name=my_name,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        keyword_to_member = dlg.assignments()
+
+        # 4. Group files by member and copy them.
+        member_files: dict[str, list[Path]] = {}
+        for kw, files in keyword_files.items():
+            assignee = keyword_to_member.get(kw)
+            if not assignee:
+                continue
+            member_files.setdefault(assignee, []).extend(files)
+
+        if not member_files:
+            return
+
+        project_name = self._report_dir.name
+        desktop = _desktop_dir()
+        base_dir = desktop / "claude-reports" / project_name
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        copy_errors: list[str] = []
+        archives: list[Path] = []
+        try:
+            for member, files in member_files.items():
+                member_dir = base_dir / _safe_dirname(member)
+                if member_dir.exists():
+                    shutil.rmtree(member_dir, ignore_errors=True)
+                member_dir.mkdir(parents=True, exist_ok=True)
+                trans_dir = member_dir / "translated"
+
+                for fp in files:
+                    try:
+                        shutil.copy2(fp, member_dir / fp.name)
+                        trans = _find_translated(fp)
+                        if trans and trans.exists():
+                            trans_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(trans, trans_dir / trans.name)
+                    except Exception as e:
+                        copy_errors.append(f"{member}/{fp.name}: {e}")
+
+                # 5. Zip the member folder and remove the original.
+                try:
+                    archive_base = str(member_dir)
+                    archive_path = shutil.make_archive(
+                        archive_base, "zip", root_dir=member_dir
+                    )
+                    archives.append(Path(archive_path))
+                    shutil.rmtree(member_dir, ignore_errors=True)
+                except Exception as e:
+                    copy_errors.append(f"{member} 압축 실패: {e}")
+
+            # 6. Move non-self plans from pending → reviewed.
+            reviewed_dir = self._report_dir / "reviewed"
+            reviewed_dir.mkdir(parents=True, exist_ok=True)
+            move_errors: list[str] = []
+            moved_count = 0
+            for member, files in member_files.items():
+                if member == my_name:
+                    continue
+                for fp in files:
+                    try:
+                        if not fp.exists():
+                            continue
+                        old_trans = _find_translated_in_pending(
+                            self._report_dir / "pending", fp.name
+                        )
+                        fp.rename(reviewed_dir / fp.name)
+                        moved_count += 1
+                        if old_trans and old_trans.exists():
+                            new_trans_dir = reviewed_dir / "translated"
+                            new_trans_dir.mkdir(parents=True, exist_ok=True)
+                            old_trans.rename(new_trans_dir / old_trans.name)
+                    except Exception as e:
+                        move_errors.append(f"{fp.name}: {e}")
+            copy_errors.extend(move_errors)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.refresh()
+
+        summary_lines = [
+            f"바탕화면에 압축본 {len(archives)}개를 만들었습니다.",
+            f"위치: {base_dir}",
+        ]
+        if archives:
+            summary_lines.append("")
+            summary_lines.extend(f"• {a.name}" for a in archives)
+
+        if copy_errors:
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            QMessageBox.warning(
+                self,
+                "분배 일부 실패",
+                "\n".join(summary_lines)
+                + "\n\n다음 항목에서 문제가 발생했습니다:\n"
+                + "\n".join(copy_errors),
+            )
+        else:
+            sound_player.play("trescue.wav")
+            QMessageBox.information(
+                self,
+                "분배 완료",
+                "\n".join(summary_lines),
+            )
+
+    def _open_settings_dialog(self) -> None:
+        from .settings_dialog import SettingsDialog
+        SettingsDialog(self).exec()
+
     # ------------------------------------------------------------------ #
     #  Button state management                                             #
     # ------------------------------------------------------------------ #
@@ -642,15 +1089,18 @@ class ReportBrowser(QWidget):
         for i in range(root.childCount()):
             folder = root.child(i)
             fdata = folder.data(0, Qt.ItemDataRole.UserRole)
-            if fdata is None:
+            if fdata is None or fdata[0] != "folder":
                 continue
             cat = fdata[1]
+            # Walk through keyword sub-folders → file items.
             for j in range(folder.childCount()):
-                child = folder.child(j)
-                if child.checkState(0) == Qt.CheckState.Checked:
-                    cdata = child.data(0, Qt.ItemDataRole.UserRole)
-                    if cdata and cdata[0] == "file":
-                        result.setdefault(cat, []).append(Path(cdata[1]))
+                kw_item = folder.child(j)
+                for k in range(kw_item.childCount()):
+                    child = kw_item.child(k)
+                    if child.checkState(0) == Qt.CheckState.Checked:
+                        cdata = child.data(0, Qt.ItemDataRole.UserRole)
+                        if cdata and cdata[0] == "file":
+                            result.setdefault(cat, []).append(Path(cdata[1]))
         return result
 
     def _update_buttons(self) -> None:
@@ -703,6 +1153,19 @@ class ReportBrowser(QWidget):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _iter_file_descendants(item: QTreeWidgetItem):
+    """Recursively yield (file_item, path) pairs for every file under `item`."""
+    for i in range(item.childCount()):
+        child = item.child(i)
+        data = child.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            continue
+        if data[0] == "file":
+            yield child, Path(data[1])
+        elif data[0] in ("folder", "keyword"):
+            yield from _iter_file_descendants(child)
+
 
 def _extract_h1(path: Path) -> str | None:
     """Return the first '# ...' heading text in the file, or None."""
@@ -839,3 +1302,261 @@ def _action_btn(label: str, bg: str, hover_bg: str) -> QPushButton:
         f"QPushButton:disabled {{ background: #333; color: #555; }}"
     )
     return btn
+
+
+# ---------------------------------------------------------------------------
+# Team distribution helpers
+# ---------------------------------------------------------------------------
+
+_KEYWORD_LINE_RE = re.compile(r"\*\*Keyword:\*\*\s*`?([^`\n]+?)`?\s*$")
+_META_KEYWORD_RE = re.compile(r"Keyword:\s*([^|\n]+?)(?:\s*\||\s*$)")
+_TITLE_CLASS_RE  = re.compile(r"^#\s+([A-Z][A-Za-z0-9_]+)([:\.\(]|\s|$)")
+_CAMEL_CASE_RE   = re.compile(r"[a-z][A-Z]")
+
+
+def _extract_keyword(path: Path) -> str | None:
+    """Pull the Keyword tag out of a plan markdown file, if present.
+
+    Order of preference:
+      1. `**Keyword:** ...` body line (newer plans).
+      2. `Keyword: ...` token in the iteration meta line.
+      3. CamelCase identifier at the start of the H1 title (older plans
+         without an explicit Keyword tag).
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    for line in text.splitlines()[:60]:
+        m = _KEYWORD_LINE_RE.search(line)
+        if m:
+            kw = m.group(1).strip()
+            if kw:
+                return kw
+        m = _META_KEYWORD_RE.search(line)
+        if m and "Iteration" in line:
+            kw = m.group(1).strip()
+            if kw:
+                return kw
+
+    # Fallback: derive from the H1 title (e.g. "# ClassName.method() …" or
+    # "# ClassName: …"). We only accept identifiers that look like a C#-style
+    # class — followed by `.`/`:`/`(`, or with internal CamelCase when followed
+    # by whitespace.
+    for line in text.splitlines()[:10]:
+        if line.startswith("#") and not line.startswith("##"):
+            tm = _TITLE_CLASS_RE.match(line)
+            if not tm:
+                break
+            ident, delim = tm.group(1), tm.group(2)
+            if delim in (".", ":", "("):
+                return ident
+            if _CAMEL_CASE_RE.search(ident):
+                return ident
+            break
+    return None
+
+
+def _read_team_members(s: QSettings) -> list[str]:
+    raw = str(s.value("team/members", "") or "")
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        name = line.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _desktop_dir() -> Path:
+    """Return the user's Desktop directory (Mac & Windows compatible)."""
+    home = Path.home()
+    candidate = home / "Desktop"
+    if candidate.exists():
+        return candidate
+    if platform.system() == "Windows":
+        import os
+        userprofile = os.environ.get("USERPROFILE")
+        if userprofile:
+            alt = Path(userprofile) / "Desktop"
+            if alt.exists():
+                return alt
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _safe_dirname(name: str) -> str:
+    cleaned = "".join(c for c in name if c.isalnum() or c in ("-", "_", "."))
+    return cleaned or "unnamed"
+
+
+def _find_translated_in_pending(pending_dir: Path, original_name: str) -> Path | None:
+    """Locate a translated companion file inside pending/translated/."""
+    trans_dir = pending_dir / "translated"
+    if not trans_dir.is_dir():
+        return None
+    stem = Path(original_name).stem
+    for f in trans_dir.glob(f"{stem}.*.md"):
+        parts = f.stem.rsplit(".", 1)
+        if len(parts) == 2 and len(parts[1]) == 2:
+            return f
+    return None
+
+
+class _KeywordAssignmentDialog(QDialog):
+    """Single dialog asking who owns each Keyword.
+
+    For each keyword, a row of buttons (one per candidate) is shown. The
+    selected button is highlighted. OK is only enabled when every keyword
+    has an assignee.
+    """
+
+    def __init__(
+        self,
+        keywords: list[str],
+        candidates: list[str],
+        my_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Keyword 담당자 지정")
+        self._keywords = list(keywords)
+        self._candidates = list(candidates)
+        self._my_name = my_name
+        self._assignments: dict[str, str] = {}
+        self._groups: dict[str, QButtonGroup] = {}
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.setStyleSheet(
+            "QDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; background: transparent; }"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+
+        intro = QLabel(
+            "각 Keyword의 담당자를 선택하세요. "
+            "본인 이름은 진하게 표시됩니다."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #ccc; font-size: 12px; background: transparent;")
+        outer.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { background: #1e1e1e; border: 1px solid #333; }"
+            "QScrollBar:vertical { width: 10px; background: #1e1e1e; }"
+            "QScrollBar::handle:vertical { background: #444; border-radius: 4px; }"
+        )
+
+        body = QWidget()
+        body.setStyleSheet("background: #1e1e1e;")
+        grid = QGridLayout(body)
+        grid.setContentsMargins(10, 10, 10, 10)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        for row, kw in enumerate(self._keywords):
+            kw_label = QLabel(kw)
+            kw_label.setStyleSheet(
+                "color: #e8e8e8; font-size: 12px; font-weight: bold;"
+                "background: transparent; padding: 4px 0;"
+            )
+            grid.addWidget(kw_label, row, 0)
+
+            btn_row = QWidget()
+            btn_row.setStyleSheet("background: transparent;")
+            btn_layout = QHBoxLayout(btn_row)
+            btn_layout.setContentsMargins(0, 0, 0, 0)
+            btn_layout.setSpacing(4)
+
+            group = QButtonGroup(self)
+            group.setExclusive(True)
+            self._groups[kw] = group
+
+            for cand in self._candidates:
+                btn = QPushButton(cand if cand != self._my_name else f"{cand} (나)")
+                btn.setCheckable(True)
+                btn.setProperty("candidate", cand)
+                btn.setStyleSheet(
+                    "QPushButton {"
+                    "  background: #2d2d2d; color: #ccc;"
+                    "  border: 1px solid #444; border-radius: 4px;"
+                    "  padding: 4px 10px; font-size: 11px;"
+                    "}"
+                    "QPushButton:hover { background: #3a3a3a; }"
+                    "QPushButton:checked {"
+                    "  background: #0e639c; color: white;"
+                    "  border-color: #1177bb; font-weight: bold;"
+                    "}"
+                )
+                if cand == self._my_name:
+                    f = btn.font()
+                    f.setBold(True)
+                    btn.setFont(f)
+                group.addButton(btn)
+                btn_layout.addWidget(btn)
+
+            btn_layout.addStretch(1)
+            grid.addWidget(btn_row, row, 1)
+
+            group.buttonClicked.connect(
+                lambda b, k=kw: self._on_picked(k, b)
+            )
+
+        grid.setColumnStretch(1, 1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, stretch=1)
+
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet(
+            "color: #ffb74d; font-size: 11px; background: transparent;"
+        )
+        outer.addWidget(self._status_label)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; border-radius: 4px;"
+            "  font-size: 12px; padding: 5px 18px; border: 1px solid #444; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:default { background: #0e78d5; color: white; border: none; }"
+            "QPushButton:default:hover { background: #1e88e5; }"
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        outer.addWidget(self._buttons)
+
+        self.resize(560, min(560, 140 + 36 * max(len(self._keywords), 1)))
+        self._update_state()
+
+    def _on_picked(self, keyword: str, button) -> None:
+        cand = button.property("candidate")
+        if cand:
+            self._assignments[keyword] = cand
+        self._update_state()
+
+    def _update_state(self) -> None:
+        missing = [k for k in self._keywords if k not in self._assignments]
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if missing:
+            self._status_label.setText(
+                f"미지정 Keyword {len(missing)}개: {', '.join(missing[:5])}"
+                + ("…" if len(missing) > 5 else "")
+            )
+            ok_btn.setEnabled(False)
+        else:
+            self._status_label.setText("")
+            ok_btn.setEnabled(True)
+
+    def assignments(self) -> dict[str, str]:
+        return dict(self._assignments)

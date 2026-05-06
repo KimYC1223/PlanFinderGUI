@@ -3,6 +3,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+
+def _anthropic_client():
+    """Build an Anthropic SDK client using the user's API key when present."""
+    import anthropic
+
+    try:
+        from .executor import _resolve_anthropic_api_key
+        key = _resolve_anthropic_api_key()
+    except Exception:
+        key = None
+    if key:
+        return anthropic.Anthropic(api_key=key)
+    return anthropic.Anthropic()
+
 # ---------------------------------------------------------------------------
 # Code-block masking helpers
 # ---------------------------------------------------------------------------
@@ -75,11 +89,9 @@ def translate_with_claude(text: str, target_lang: str = "ko") -> str:
 
     Keeps markdown formatting, code blocks, and file paths unchanged.
     """
-    import anthropic
-
     masked, blocks = _mask_code(text)
 
-    client = anthropic.Anthropic()
+    client = _anthropic_client()
 
     lang_names = {
         "ko": "Korean",

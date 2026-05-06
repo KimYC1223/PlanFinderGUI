@@ -33,6 +33,16 @@ class DiscoveredPlan(BaseModel):
 
     title: str = Field(description="Short descriptive title for the improvement plan")
     category: PlanCategory = Field(description="Category of the improvement")
+    keyword: str = Field(
+        description=(
+            "A single PascalCase Feature or Component name that identifies "
+            "the area of the codebase this plan touches, so an owner can be "
+            "assigned by feature. Must be a feature/component (e.g. "
+            "'LoginFlow', 'PaymentCheckout', 'InventoryUI'), NOT an error "
+            "category, severity tag, or generic acronym (e.g. 'NRE', 'Bug', "
+            "'Perf'). One word, no spaces."
+        ),
+    )
     description: str = Field(
         description="Detailed description of the improvement opportunity"
     )
