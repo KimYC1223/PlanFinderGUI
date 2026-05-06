@@ -89,5 +89,5 @@ else:
         strip=False,
         upx=True,
         console=False,
-        icon='img/scv.icns',
+        icon=app_icon,
     )
