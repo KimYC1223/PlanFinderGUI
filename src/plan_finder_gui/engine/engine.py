@@ -39,9 +39,22 @@ def _is_retriable_error(err_msg: str) -> bool:
     )
 
 
+def _quiet_hours_enabled() -> bool:
+    """Read the user's Quiet Hours toggle from QSettings (default: enabled)."""
+    try:
+        from PySide6.QtCore import QSettings
+        v = QSettings().value("quiet_hours_enabled", True)
+    except Exception:
+        return True
+    return v in (True, "true", "True", "1")
+
+
 async def _wait_if_quiet_hours(display: DisplayInterface) -> None:
-    """Sleep until quiet hours (22:00~03:00) are over."""
+    """Sleep until quiet hours (22:00~03:00) are over (when enabled)."""
     from datetime import datetime, timedelta
+
+    if not _quiet_hours_enabled():
+        return
 
     now = datetime.now()
     hour = now.hour

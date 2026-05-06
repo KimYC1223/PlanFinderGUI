@@ -124,8 +124,8 @@ class _SessionCard(QFrame):
         )
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 4, 6, 4)
-        outer.setSpacing(2)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
 
         header = QHBoxLayout()
         header.setSpacing(6)
@@ -224,8 +224,8 @@ class SessionsPanel(QWidget):
         group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
         self._inner = QVBoxLayout(group)
-        self._inner.setContentsMargins(8, 6, 8, 6)
-        self._inner.setSpacing(4)
+        self._inner.setContentsMargins(10, 10, 10, 10)
+        self._inner.setSpacing(6)
 
         self._empty_lbl = QLabel("실행 중인 세션이 없습니다.")
         self._empty_lbl.setStyleSheet(_DIM_SS)

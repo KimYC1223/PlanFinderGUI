@@ -140,8 +140,8 @@ class ClaudeSessionPanel(QWidget):
         )
         group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         inner = QVBoxLayout(group)
-        inner.setContentsMargins(8, 6, 8, 6)
-        inner.setSpacing(2)
+        inner.setContentsMargins(10, 10, 10, 10)
+        inner.setSpacing(4)
 
         lbl_style = "color: #999; font-size: 11px; background: transparent;"
         val_style = "color: #ccc; font-size: 11px; background: transparent;"

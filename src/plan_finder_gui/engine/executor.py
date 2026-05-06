@@ -117,12 +117,16 @@ async def _maybe_auto_commit(plan_path: Path, cwd: str, display) -> None:
             display.log("자동 커밋: 플랜 제목을 읽을 수 없어 건너뜀")
             return
 
-        display.log(f"커밋 메시지 생성 중... ({lang})")
-        loop = asyncio.get_event_loop()
-        commit_msg = await loop.run_in_executor(None, generate_commit_message, title, lang)
+        api_key = _resolve_anthropic_api_key()
+        if api_key:
+            display.log(f"커밋 메시지 생성 중... ({lang}, Anthropic API 사용)")
+        else:
+            display.log(f"커밋 메시지 생성 중... ({lang}, 로컬 Claude CLI 사용)")
+        commit_msg = await generate_commit_message(title, lang, cwd)
         display.log(f"커밋 메시지: {commit_msg}")
 
         display.log("git add + commit 실행 중...")
+        loop = asyncio.get_event_loop()
         success, output = await loop.run_in_executor(None, git_commit, cwd, commit_msg)
         if success:
             display.log(f"커밋 완료: {commit_msg}")
@@ -160,14 +164,16 @@ async def _maybe_auto_commit_batch(plan_paths: list[Path], cwd: str, display) ->
             display.log("자동 커밋: 플랜 제목을 읽을 수 없어 건너뜀")
             return
 
-        display.log(f"커밋 메시지 생성 중... ({lang}, {len(titles)}개 묶음)")
-        loop = asyncio.get_event_loop()
-        commit_msg = await loop.run_in_executor(
-            None, generate_batch_commit_message, titles, lang
-        )
+        api_key = _resolve_anthropic_api_key()
+        if api_key:
+            display.log(f"커밋 메시지 생성 중... ({lang}, {len(titles)}개 묶음, Anthropic API 사용)")
+        else:
+            display.log(f"커밋 메시지 생성 중... ({lang}, {len(titles)}개 묶음, 로컬 Claude CLI 사용)")
+        commit_msg = await generate_batch_commit_message(titles, lang, cwd)
         display.log(f"커밋 메시지: {commit_msg}")
 
         display.log("git add + commit 실행 중...")
+        loop = asyncio.get_event_loop()
         success, output = await loop.run_in_executor(None, git_commit, cwd, commit_msg)
         if success:
             display.log(f"커밋 완료: {commit_msg}")

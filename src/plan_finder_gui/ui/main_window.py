@@ -44,6 +44,12 @@ def _find_translated_helper(original: Path) -> Path | None:
     return None
 
 
+def _is_translated_md(path: Path) -> bool:
+    """True when filename matches *.XX.md (2-letter language suffix)."""
+    parts = path.stem.rsplit(".", 1)
+    return len(parts) == 2 and len(parts[1]) == 2
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -95,6 +101,80 @@ class MainWindow(QMainWindow):
         quit_act.setMenuRole(QAction.MenuRole.QuitRole)
         quit_act.triggered.connect(QApplication.quit)
         app_menu.addAction(quit_act)
+
+        # ── View menu ─────────────────────────────────────────────
+        view_menu = bar.addMenu("View")
+
+        self._act_show_left = QAction("Info View", self)
+        self._act_show_left.setCheckable(True)
+        self._act_show_left.setChecked(True)
+        self._act_show_left.triggered.connect(self._toggle_left_panel)
+        view_menu.addAction(self._act_show_left)
+
+        self._act_show_browser = QAction("트리 & 파일 미리보기", self)
+        self._act_show_browser.setCheckable(True)
+        self._act_show_browser.setChecked(True)
+        self._act_show_browser.triggered.connect(self._toggle_browser_panel)
+        view_menu.addAction(self._act_show_browser)
+
+        self._act_show_log = QAction("Logger", self)
+        self._act_show_log.setCheckable(True)
+        self._act_show_log.setChecked(True)
+        self._act_show_log.triggered.connect(self._toggle_log_panel)
+        view_menu.addAction(self._act_show_log)
+
+        # ── 옵션 menu ─────────────────────────────────────────────
+        options_menu = bar.addMenu("옵션")
+
+        self._act_quiet_hours = QAction("Quiet Hours (22:00~03:00 자동 일시정지)", self)
+        self._act_quiet_hours.setCheckable(True)
+        self._act_quiet_hours.setChecked(
+            QSettings().value("quiet_hours_enabled", True) in (True, "true", "True", "1")
+        )
+        self._act_quiet_hours.toggled.connect(self._on_quiet_hours_toggled)
+        options_menu.addAction(self._act_quiet_hours)
+
+    def _on_quiet_hours_toggled(self, checked: bool) -> None:
+        QSettings().setValue("quiet_hours_enabled", checked)
+
+    def _toggle_left_panel(self, checked: bool) -> None:
+        if checked:
+            self._left.setVisible(True)
+            sizes = self._main_splitter.sizes()
+            if sizes and sizes[0] == 0:
+                total = sum(sizes) or 1300
+                self._main_splitter.setSizes([320, max(total - 320, 600)])
+        else:
+            self._left.setVisible(False)
+
+    def _toggle_browser_panel(self, checked: bool) -> None:
+        if checked:
+            self.report_browser.setVisible(True)
+            sizes = self._right_splitter.sizes()
+            if sizes and sizes[0] == 0:
+                total = sum(sizes) or 800
+                self._right_splitter.setSizes([580, max(total - 580, 100)])
+        else:
+            self.report_browser.setVisible(False)
+
+    def _toggle_log_panel(self, checked: bool) -> None:
+        if checked:
+            self.log_panel.setVisible(True)
+            sizes = self._right_splitter.sizes()
+            if len(sizes) >= 2 and sizes[1] == 0:
+                total = sum(sizes) or 800
+                self._right_splitter.setSizes([max(total - 220, 100), 220])
+        else:
+            self.log_panel.setVisible(False)
+
+    def _sync_view_actions(self, *_: object) -> None:
+        main = self._main_splitter.sizes()
+        if main:
+            self._act_show_left.setChecked(main[0] > 0 and self._left.isVisible())
+        right = self._right_splitter.sizes()
+        if len(right) >= 2:
+            self._act_show_browser.setChecked(right[0] > 0 and self.report_browser.isVisible())
+            self._act_show_log.setChecked(right[1] > 0 and self.log_panel.isVisible())
 
     def _open_settings(self) -> None:
         from .settings_dialog import SettingsDialog
@@ -224,15 +304,13 @@ class MainWindow(QMainWindow):
         # ── Pinned header ─────────────────────────────────────────
         header = QWidget()
         header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        header.setStyleSheet(
-            "background: #1e1e1e; border-bottom: 1px solid #2c2c2c;"
-        )
+        header.setStyleSheet("background: #1e1e1e;")
         header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(12, 10, 12, 8)
+        header_layout.setContentsMargins(12, 18, 12, 16)
         header_layout.setSpacing(0)
         header_title = QLabel("Plan Finder")
         header_title.setStyleSheet(
-            "color: #e8e8e8; font-size: 16px; font-weight: bold;"
+            "color: #e8e8e8; font-size: 22px; font-weight: bold;"
         )
         header_layout.addWidget(header_title)
         left_layout.addWidget(header)
@@ -240,6 +318,9 @@ class MainWindow(QMainWindow):
         # ── Tabs ──────────────────────────────────────────────────
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
+        tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        tabs.setUsesScrollButtons(False)
+        tabs.tabBar().setExpanding(True)
         tabs.setStyleSheet(
             "QTabWidget::pane { border: none; background: #1e1e1e; }"
             "QTabBar { background: #1e1e1e; }"
@@ -252,7 +333,11 @@ class MainWindow(QMainWindow):
             "QTabBar::tab:hover:!selected { background: #2a2d2e; color: #ccc; }"
         )
 
-        # Tab 1: 활성 Claude 정보 ──────────────────────────────────
+        # Tab 1: 검사 정보 ────────────────────────────────────────
+        self.config_panel = ConfigPanel()
+        tabs.addTab(self.config_panel, "검사 정보")
+
+        # Tab 2: 활성 Claude 정보 ──────────────────────────────────
         active_tab = QWidget()
         active_tab.setStyleSheet("background: #1e1e1e;")
         active_layout = QVBoxLayout(active_tab)
@@ -261,22 +346,18 @@ class MainWindow(QMainWindow):
 
         # Live PlanFinder sessions (with CPU sparklines)
         self.sessions_panel = SessionsPanel(self._session_manager)
-        self.sessions_panel.setContentsMargins(12, 8, 12, 0)
+        self.sessions_panel.setContentsMargins(12, 12, 12, 6)
         active_layout.addWidget(self.sessions_panel)
 
         # Claude session info panel (ccusage-driven aggregate stats).
         self.claude_session_panel = ClaudeSessionPanel()
-        self.claude_session_panel.setContentsMargins(12, 0, 12, 8)
+        self.claude_session_panel.setContentsMargins(12, 6, 12, 12)
         active_layout.addWidget(self.claude_session_panel, stretch=1)
 
         self.status_bar_widget = StatusBar()
         active_layout.addWidget(self.status_bar_widget)
 
         tabs.addTab(active_tab, "활성 Claude 정보")
-
-        # Tab 2: 검사 정보 ────────────────────────────────────────
-        self.config_panel = ConfigPanel()
-        tabs.addTab(self.config_panel, "검사 정보")
 
         left_layout.addWidget(tabs, stretch=1)
 
@@ -318,7 +399,12 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(right_splitter)
         splitter.addWidget(right)
 
-        splitter.setSizes([400, 900])
+        splitter.setSizes([320, 980])
+        self._left = left
+        self._main_splitter = splitter
+        self._right_splitter = right_splitter
+        splitter.splitterMoved.connect(self._sync_view_actions)
+        right_splitter.splitterMoved.connect(self._sync_view_actions)
         root.addWidget(splitter)
 
         # Wire config buttons
@@ -333,10 +419,11 @@ class MainWindow(QMainWindow):
 
         # Update report dir when project dir changes
         self.config_panel.project_dir_edit.textChanged.connect(self._on_project_dir_changed)
-        # Trigger once on startup
-        QTimer.singleShot(0, lambda: self._on_project_dir_changed(
-            self.config_panel.project_dir_edit.text()
-        ))
+        # Trigger once on startup, then recover any leftover working/ items.
+        # Files end up stranded in working/ when a previous resolve session was
+        # interrupted (app closed mid-run); restoring them to pending lets the
+        # user re-trigger or reject without hunting them down manually.
+        QTimer.singleShot(0, self._startup_init)
 
     # ------------------------------------------------------------------ #
     #  Report dir helpers                                                  #
@@ -353,6 +440,85 @@ class MainWindow(QMainWindow):
             report_dir = Path.home() / "claude-reports" / project_name
             self.report_browser.set_report_dir(report_dir)
 
+    def _startup_init(self) -> None:
+        self._on_project_dir_changed(self.config_panel.project_dir_edit.text())
+        self._recover_working_to_pending()
+
+    def _recover_working_to_pending(self) -> None:
+        """Restore any files left in working/ back to pending/ on startup."""
+        config = self.config_panel.get_config()
+        if not config.get("project_dir"):
+            return
+        report_dir = self._get_report_dir()
+        working_dir = report_dir / "working"
+        if not working_dir.is_dir():
+            return
+
+        pending_dir = report_dir / "pending"
+        moved = 0
+        skipped: list[str] = []
+
+        for src in sorted(working_dir.glob("*.md")):
+            if _is_translated_md(src):
+                # Sibling translations move alongside their original below.
+                continue
+            dest = pending_dir / src.name
+            if dest.exists():
+                skipped.append(src.name)
+                continue
+            try:
+                pending_dir.mkdir(parents=True, exist_ok=True)
+                src.rename(dest)
+                moved += 1
+            except OSError as e:
+                self.log_panel.append_log(
+                    f"working → pending 이동 실패: {src.name} ({e})", "warn"
+                )
+                continue
+
+            stem = src.stem
+
+            # Sibling translation: working/<stem>.<lang>.md
+            for trans in working_dir.glob(f"{stem}.*.md"):
+                if not _is_translated_md(trans):
+                    continue
+                trans_dest = pending_dir / trans.name
+                if trans_dest.exists():
+                    continue
+                try:
+                    trans.rename(trans_dest)
+                except OSError:
+                    pass
+
+            # Subdirectory translation: working/translated/<stem>.<lang>.md
+            working_trans_dir = working_dir / "translated"
+            if working_trans_dir.is_dir():
+                for trans in working_trans_dir.glob(f"{stem}.*.md"):
+                    if not _is_translated_md(trans):
+                        continue
+                    pending_trans_dir = pending_dir / "translated"
+                    pending_trans_dir.mkdir(parents=True, exist_ok=True)
+                    trans_dest = pending_trans_dir / trans.name
+                    if trans_dest.exists():
+                        continue
+                    try:
+                        trans.rename(trans_dest)
+                    except OSError:
+                        pass
+
+        if moved:
+            self.log_panel.append_log(
+                f"working → pending 복구: {moved}개 파일 이동", "info"
+            )
+            self.report_browser.refresh()
+        if skipped:
+            self.log_panel.append_log(
+                f"working → pending 건너뜀 (pending에 동일 이름 존재): "
+                + ", ".join(skipped[:5])
+                + (f" 외 {len(skipped) - 5}개" if len(skipped) > 5 else ""),
+                "warn",
+            )
+
     # ------------------------------------------------------------------ #
     #  Session management                                                  #
     # ------------------------------------------------------------------ #
@@ -360,6 +526,37 @@ class MainWindow(QMainWindow):
     def _warn(self, title: str, msg: str) -> None:
         sound_player.play("buzz.wav")
         QMessageBox.warning(self, title, msg)
+
+    def _ensure_project_access(self, project_dir: str) -> bool:
+        """Validate project dir + pre-trigger macOS folder-access prompt.
+
+        Called from every entry point that spawns a Claude session (Start /
+        Resolve / Restart) so the permission dialog is always handled at the
+        start of work, not midway through.
+        """
+        if not project_dir:
+            self._warn("Missing Input", "Please select a project directory.")
+            return False
+        path = Path(project_dir)
+        if not path.exists():
+            self._warn("Invalid Path", "The specified path does not exist.")
+            return False
+        if not path.is_dir():
+            self._warn("Invalid Path", "Please select a directory, not a file.")
+            return False
+        try:
+            next(iter(path.iterdir()), None)
+        except PermissionError:
+            self._warn(
+                "권한 오류",
+                "프로젝트 디렉토리에 접근할 수 없습니다.\n"
+                "시스템 설정 → 개인정보 보호 및 보안에서 PlanFinder의 폴더 접근 권한을 허용해주세요.",
+            )
+            return False
+        except OSError as e:
+            self._warn("디렉토리 오류", f"프로젝트 디렉토리를 읽을 수 없습니다: {e}")
+            return False
+        return True
 
     def start_session(self) -> None:
         from ..engine.executor import _show_error
@@ -375,29 +572,7 @@ class MainWindow(QMainWindow):
     def _start_session_impl(self) -> None:
         config = self.config_panel.get_config()
 
-        if not config["project_dir"]:
-            self._warn("Missing Input", "Please select a project directory.")
-            return
-        _project_path = Path(config["project_dir"])
-        if not _project_path.exists():
-            self._warn("Invalid Path", "The specified path does not exist.")
-            return
-        if not _project_path.is_dir():
-            self._warn("Invalid Path", "Please select a directory, not a file.")
-            return
-        # macOS의 폴더 접근 권한 팝업을 지금 트리거해서, 나중에 대기 후
-        # 작업이 권한 다이얼로그에서 멈추는 일이 없도록 한다.
-        try:
-            next(iter(_project_path.iterdir()), None)
-        except PermissionError:
-            self._warn(
-                "권한 오류",
-                "프로젝트 디렉토리에 접근할 수 없습니다.\n"
-                "시스템 설정 → 개인정보 보호 및 보안에서 PlanFinder의 폴더 접근 권한을 허용해주세요.",
-            )
-            return
-        except OSError as e:
-            self._warn("디렉토리 오류", f"프로젝트 디렉토리를 읽을 수 없습니다: {e}")
+        if not self._ensure_project_access(config["project_dir"]):
             return
         if not config["prompt"]:
             self._warn("Missing Input", "Please enter a prompt.")
@@ -676,6 +851,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # macOS native fullscreen + a modal QMessageBox = black screen, because
+        # the dialog appears in a different Space while the fullscreen Space is
+        # left empty. Exit fullscreen first and re-issue the close after the
+        # ~half-second fullscreen-exit animation finishes.
+        if self.isFullScreen():
+            self.showNormal()
+            event.ignore()
+            QTimer.singleShot(500, self.close)
+            return
+
         # If the user explicitly chose Quit (tray menu or app menu) we skip
         # the prompt. Otherwise consult the saved preference / ask.
         if not self._force_quit and self._tray is not None:
@@ -838,6 +1023,10 @@ class MainWindow(QMainWindow):
         """Move pending files to working/, then start a resolve session."""
         from ..engine.executor import _show_error
 
+        config = self.config_panel.get_config()
+        if not self._ensure_project_access(config["project_dir"]):
+            return
+
         try:
             report_dir = self._get_report_dir()
             working_dir = report_dir / "working"
@@ -868,7 +1057,6 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            config = self.config_panel.get_config()
             adapter = GuiDisplayAdapter(self)
 
             from ..engine.executor import run_resolve_session
@@ -923,8 +1111,11 @@ class MainWindow(QMainWindow):
         if not plan_paths:
             return
 
+        config = self.config_panel.get_config()
+        if not self._ensure_project_access(config["project_dir"]):
+            return
+
         try:
-            config = self.config_panel.get_config()
             adapter = GuiDisplayAdapter(self)
 
             label = (

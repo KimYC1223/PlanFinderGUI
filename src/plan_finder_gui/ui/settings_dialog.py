@@ -180,9 +180,26 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
+        from .api_key_widget import ApiKeyEditor
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
+
+        # ── API 키 ─────────────────────────────────────────────────────
+        api_group = QGroupBox("API 키")
+        api_group.setStyleSheet(_GROUP_SS)
+        api_inner = QVBoxLayout(api_group)
+        api_inner.setContentsMargins(8, 8, 8, 8)
+        api_inner.setSpacing(6)
+
+        api_label = QLabel("PlanFinder용 API Key")
+        api_label.setStyleSheet(_LABEL_SS)
+        api_inner.addWidget(api_label)
+
+        self._api_key_editor = ApiKeyEditor()
+        api_inner.addWidget(self._api_key_editor)
+        layout.addWidget(api_group)
 
         # ── 사운드 ──────────────────────────────────────────────────────
         sound_group = QGroupBox("사운드")

@@ -320,11 +320,13 @@ class ReportBrowser(QWidget):
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
+        self._tree.setRootIsDecorated(False)
+        self._tree.setIndentation(14)
         self._tree.setStyleSheet(
             "QTreeWidget {"
             "  background: #1e1e1e; color: #ccc; border: none; font-size: 12px;"
             "}"
-            "QTreeWidget::item { padding: 3px 4px; }"
+            "QTreeWidget::item { padding: 3px 4px 3px 0; }"
             "QTreeWidget::item:selected { background: #094771; color: #e8e8e8; }"
             "QTreeWidget::item:hover { background: #252527; }"
             "QTreeWidget::branch { background: #1e1e1e; }"
@@ -446,7 +448,7 @@ class ReportBrowser(QWidget):
             color = _CATEGORY_COLORS.get(cat, "#ccc")
             bg    = _CATEGORY_BG.get(cat, "#2a2a2a")
             label = _CATEGORY_LABELS.get(cat, cat)
-            folder_item = QTreeWidgetItem([f"  {label}  ({len(files)})"])
+            folder_item = QTreeWidgetItem([f"{label}  ({len(files)})"])
             folder_item.setData(0, Qt.ItemDataRole.UserRole, ("folder", cat))
             folder_item.setForeground(0, QColor(color))
             folder_item.setBackground(0, QColor(bg))
@@ -458,14 +460,14 @@ class ReportBrowser(QWidget):
             )
             for kw in sorted_keywords:
                 kw_files = by_keyword[kw]
-                kw_item = QTreeWidgetItem([f"  {kw}  ({len(kw_files)})"])
+                kw_item = QTreeWidgetItem([f"{kw}  ({len(kw_files)})"])
                 kw_item.setData(0, Qt.ItemDataRole.UserRole, ("keyword", cat, kw))
                 kw_item.setForeground(0, QColor("#9aa0a6"))
                 folder_item.addChild(kw_item)
 
                 for f in kw_files:
                     name = _display_name(f)
-                    file_item = QTreeWidgetItem([f"  {name}"])
+                    file_item = QTreeWidgetItem([f"{name}"])
                     file_item.setCheckState(0, Qt.CheckState.Unchecked)
                     file_item.setData(0, Qt.ItemDataRole.UserRole, ("file", str(f), cat))
                     file_item.setForeground(0, QColor("#cccccc"))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime as ddatetime
 
-from PySide6.QtCore import QDate, QObject, QPoint, QSettings, Qt, QThread, QTime, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, QObject, QSettings, Qt, QTime, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,39 +26,19 @@ from PySide6.QtWidgets import (
 )
 
 
-def _validate_anthropic_key(key: str) -> bool:
-    """Ping /v1/models to verify the API key is accepted by Anthropic."""
-    import urllib.error
-    import urllib.request
+class _WheelBlocker(QObject):
+    """Event filter that swallows wheel events on focus-sensitive inputs.
 
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/models?limit=1",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return 200 <= resp.status < 300
-    except urllib.error.HTTPError:
-        return False
-    except Exception:
+    Spinboxes and comboboxes change value on scroll by default, which is easy
+    to trigger by accident while scrolling the surrounding panel.
+    """
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Wheel:
+            event.ignore()
+            return True
         return False
 
-
-class _ApiKeyValidator(QObject):
-    """Worker that validates an Anthropic API key off the UI thread."""
-
-    finished = Signal(bool, str)  # (is_valid, key_that_was_checked)
-
-    def __init__(self, key: str) -> None:
-        super().__init__()
-        self._key = key
-
-    def run(self) -> None:
-        valid = _validate_anthropic_key(self._key)
-        self.finished.emit(valid, self._key)
 
 _MODELS = [
     "claude-opus-4-5",
@@ -76,9 +56,10 @@ class ConfigPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumWidth(260)
+        self.setMinimumWidth(300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background: #1e1e1e;")
+        self._wheel_blocker = _WheelBlocker(self)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -99,41 +80,9 @@ class ConfigPanel(QWidget):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         layout = QVBoxLayout(inner)
-        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
         scroll.setWidget(inner)
-
-        # ── API 키 ──────────────────────────────────────────────
-        api_group = _group("API 키")
-        api_form = _form()
-
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setPlaceholderText("sk-ant-…")
-        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setFixedHeight(_INPUT_H)
-        _style_input(self.api_key_edit)
-
-        api_form.addRow(_label("PlanFinder용 API Key"), _with_info(self.api_key_edit, _INFO_API_KEY))
-        api_group.layout().addLayout(api_form)
-
-        self.api_key_status_label = QLabel(
-            "현재 로컬에 로그인된 Claude 정보를 사용하여 동작합니다."
-        )
-        self.api_key_status_label.setWordWrap(True)
-        self.api_key_status_label.setStyleSheet(
-            "color: #888; font-size: 11px; background: transparent; padding-top: 2px;"
-        )
-        api_group.layout().addWidget(self.api_key_status_label)
-        layout.addWidget(api_group)
-
-        # Debounce key validation so we don't ping the API on every keystroke.
-        self._api_key_validation_timer = QTimer(self)
-        self._api_key_validation_timer.setSingleShot(True)
-        self._api_key_validation_timer.setInterval(600)
-        self._api_key_validation_timer.timeout.connect(self._start_api_key_validation)
-        self._api_key_validator_thread: QThread | None = None
-        self._api_key_validator_worker: _ApiKeyValidator | None = None
-        self.api_key_edit.textChanged.connect(self._on_api_key_text_changed)
 
         # ── 프로젝트 ─────────────────────────────────────────────
         proj_group = _group("프로젝트")
@@ -222,7 +171,7 @@ class ConfigPanel(QWidget):
 
         self.budget_spin = QDoubleSpinBox()
         self.budget_spin.setRange(1.0, 500.0)
-        self.budget_spin.setValue(40.0)
+        self.budget_spin.setValue(80.0)
         self.budget_spin.setSuffix(" $")
         self.budget_spin.setSingleStep(5.0)
         self.budget_spin.setFixedHeight(_INPUT_H)
@@ -243,6 +192,15 @@ class ConfigPanel(QWidget):
         self.max_turns_spin.setFixedHeight(_INPUT_H)
         self.max_turns_spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _style_spin(self.max_turns_spin)
+
+        for w in (
+            self.model_combo,
+            self.budget_spin,
+            self.max_iter_spin,
+            self.max_turns_spin,
+        ):
+            w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            w.installEventFilter(self._wheel_blocker)
 
         sess_form.addRow(_label("모델"),      _with_info(self.model_combo, _INFO_MODEL))
         sess_form.addRow(_label("예산"),      _with_info(self.budget_spin, _INFO_BUDGET))
@@ -271,12 +229,17 @@ class ConfigPanel(QWidget):
         self.stop_at_time_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _style_spin(self.stop_at_time_edit)
 
-        self.stop_at_hint = QLabel("체크하면 종료할 날짜·시간을 선택할 수 있습니다.")
+        for w in (self.stop_at_date_edit, self.stop_at_time_edit):
+            w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            w.installEventFilter(self._wheel_blocker)
+
+        self.stop_at_hint = QLabel("체크 시 종료 시간 설정")
         self.stop_at_hint.setStyleSheet(
-            "color: #888; font-size: 12px; background: transparent;"
+            "color: #888; font-size: 11px; background: transparent;"
         )
         self.stop_at_hint.setFixedHeight(_INPUT_H)
-        self.stop_at_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.stop_at_hint.setMinimumWidth(0)
+        self.stop_at_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         def _toggle_stop_at(checked: bool) -> None:
             self.stop_at_date_edit.setVisible(checked)
@@ -418,21 +381,6 @@ class ConfigPanel(QWidget):
     def restore_settings(self) -> None:
         s = QSettings()
 
-        # Pre-populate the API key edit but don't trigger a network call yet —
-        # we'll let the debounce timer handle revalidation. The status label
-        # starts in its "local Claude login" state, which is correct until we
-        # confirm the key still works.
-        saved_key = str(s.value("anthropic_api_key", "") or "")
-        if saved_key:
-            self.api_key_edit.blockSignals(True)
-            self.api_key_edit.setText(saved_key)
-            self.api_key_edit.blockSignals(False)
-            # Optimistically reflect the previously-validated state; the
-            # background revalidation below will correct us if the key has
-            # been revoked since then.
-            self._set_api_key_status(using_user_key=True)
-            QTimer.singleShot(0, self._start_api_key_validation)
-
         project_dir = s.value("project_dir", "")
         if project_dir:
             self.project_dir_edit.setText(str(project_dir))
@@ -505,74 +453,6 @@ class ConfigPanel(QWidget):
         idx = self.translate_method_combo.findText(str(translate_method))
         if idx >= 0:
             self.translate_method_combo.setCurrentIndex(idx)
-
-    # ------------------------------------------------------------------ #
-    #  API key validation                                                  #
-    # ------------------------------------------------------------------ #
-
-    def _on_api_key_text_changed(self, _text: str) -> None:
-        # Restart the debounce timer on every keystroke.
-        self._api_key_validation_timer.start()
-
-    def _set_api_key_status(self, *, using_user_key: bool) -> None:
-        if using_user_key:
-            self.api_key_status_label.setText(
-                "이제 해당 API Key를 사용하여 Claude를 사용하여 동작합니다."
-            )
-            self.api_key_status_label.setStyleSheet(
-                "color: #4ec9b0; font-size: 11px; background: transparent;"
-                " padding-top: 2px;"
-            )
-        else:
-            self.api_key_status_label.setText(
-                "현재 로컬에 로그인된 Claude 정보를 사용하여 동작합니다."
-            )
-            self.api_key_status_label.setStyleSheet(
-                "color: #888; font-size: 11px; background: transparent;"
-                " padding-top: 2px;"
-            )
-
-    def _start_api_key_validation(self) -> None:
-        key = self.api_key_edit.text().strip()
-        if not key:
-            QSettings().remove("anthropic_api_key")
-            self._set_api_key_status(using_user_key=False)
-            return
-
-        # Cheap format guard: avoid network calls for clearly invalid input.
-        if not key.startswith("sk-ant-") or len(key) < 20:
-            QSettings().remove("anthropic_api_key")
-            self._set_api_key_status(using_user_key=False)
-            return
-
-        # We don't tear down any in-flight validator — _on_api_key_validated
-        # discards results whose `checked_key` doesn't match the current edit
-        # text, so stale callbacks are harmless.
-        thread = QThread(self)
-        worker = _ApiKeyValidator(key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_api_key_validated)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._api_key_validator_thread = thread
-        self._api_key_validator_worker = worker
-        thread.start()
-
-    def _on_api_key_validated(self, valid: bool, checked_key: str) -> None:
-        # Discard stale results when the user has typed more since this
-        # validation was kicked off.
-        current = self.api_key_edit.text().strip()
-        if checked_key != current:
-            return
-
-        if valid and current:
-            QSettings().setValue("anthropic_api_key", current)
-            self._set_api_key_status(using_user_key=True)
-        else:
-            QSettings().remove("anthropic_api_key")
-            self._set_api_key_status(using_user_key=False)
 
     def _browse_project(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -653,7 +533,7 @@ def _group(title: str) -> QGroupBox:
     )
     g.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
     inner = QVBoxLayout()
-    inner.setContentsMargins(8, 8, 8, 8)
+    inner.setContentsMargins(10, 10, 10, 10)
     inner.setSpacing(6)
     g.setLayout(inner)
     return g
@@ -729,14 +609,6 @@ def _wrap(layout) -> QWidget:
 # ---------------------------------------------------------------------------
 # (i) info button helpers
 # ---------------------------------------------------------------------------
-
-_INFO_API_KEY = (
-    "PlanFinder가 Claude API를 호출할 때 사용할 Anthropic API Key입니다.\n\n"
-    "• 비워두거나 유효하지 않으면 로컬에 로그인된 Claude(claude CLI) 정보를\n"
-    "  사용하여 동작합니다.\n"
-    "• 유효한 키를 입력하면 해당 키를 사용해 Claude를 호출합니다.\n\n"
-    "키는 로컬 설정에만 저장됩니다."
-)
 
 _INFO_MODEL = (
     "사용할 Claude 모델을 선택합니다.\n\n"
