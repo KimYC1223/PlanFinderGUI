@@ -9,7 +9,35 @@ from PySide6.QtWidgets import QApplication
 from .ui.main_window import MainWindow
 
 
+def _suppress_windows_subprocess_consoles() -> None:
+    # PyInstaller ``console=False`` build has no parent console, so any
+    # console-mode child (claude.cmd, node.exe, git.exe, …) gets a fresh
+    # console window. Default ``creationflags`` to ``CREATE_NO_WINDOW`` so
+    # subprocesses spawned by our code, asyncio, and the Claude SDK all
+    # stay hidden.
+    if sys.platform != "win32":
+        return
+    import subprocess
+
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_CONSOLE = 0x00000010
+    _CONSOLE_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_CONSOLE
+
+    _orig_init = subprocess.Popen.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        flags = kwargs.get("creationflags") or 0
+        if not (flags & _CONSOLE_FLAGS):
+            kwargs["creationflags"] = flags | CREATE_NO_WINDOW
+        return _orig_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _patched_init
+
+
 def main() -> None:
+    _suppress_windows_subprocess_consoles()
+
     # macOS .app bundles launched from Finder/Dock don't inherit the shell
     # PATH, so /opt/homebrew/bin and nvm-managed Node bins are missing. Pull
     # them in before any subprocess (ccusage, claude, npm, brew) is spawned.

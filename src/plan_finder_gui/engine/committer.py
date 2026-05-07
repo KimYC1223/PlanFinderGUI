@@ -73,6 +73,9 @@ async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, query
 
+    from .executor import _StderrBuffer
+
+    stderr_buf = _StderrBuffer()
     options = ClaudeAgentOptions(
         allowed_tools=[],
         permission_mode="bypassPermissions",
@@ -82,6 +85,7 @@ async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
             "You are generating a single git commit message. Output only the "
             "commit message itself — no explanations, no quotes, no prefixes."
         ),
+        stderr=stderr_buf,
     )
 
     try:
@@ -93,12 +97,20 @@ async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
         pass
 
     parts: list[str] = []
-    async for msg in query(prompt=prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                text = getattr(block, "text", None)
-                if text:
-                    parts.append(text)
+    try:
+        async for msg in query(prompt=prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    text = getattr(block, "text", None)
+                    if text:
+                        parts.append(text)
+    except Exception as e:
+        stderr_text = stderr_buf.text()
+        if stderr_text:
+            raise RuntimeError(
+                f"{e}\n\nClaude CLI stderr:\n{stderr_text}"
+            ) from e
+        raise
     return "".join(parts).strip()
 
 

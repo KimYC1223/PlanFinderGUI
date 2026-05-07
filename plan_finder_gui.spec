@@ -79,10 +79,8 @@ else:
     exe = EXE(
         pyz,
         a.scripts,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
         [],
+        exclude_binaries=True,
         name='PlanFinder',
         debug=False,
         bootloader_ignore_signals=False,
@@ -90,4 +88,14 @@ else:
         upx=True,
         console=False,
         icon=app_icon,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name='PlanFinder',
     )

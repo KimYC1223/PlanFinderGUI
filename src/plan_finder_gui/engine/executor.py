@@ -34,6 +34,31 @@ def _show_error(title: str, summary: str, exc: BaseException | None = None) -> N
             traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
+class _StderrBuffer:
+    """Capture stderr lines from the Claude CLI subprocess.
+
+    The SDK only pipes stderr when ``ClaudeAgentOptions.stderr`` is set;
+    without a callback, ``ProcessError`` surfaces as
+    ``stderr="Check stderr output for details"`` and the real failure is
+    invisible. We attach this buffer so callers can append the captured
+    text to their error reports.
+    """
+
+    _MAX_LINES = 400
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+
+    def __call__(self, line: str) -> None:
+        if len(self._lines) < self._MAX_LINES:
+            self._lines.append(line)
+        elif len(self._lines) == self._MAX_LINES:
+            self._lines.append("... (stderr truncated)")
+
+    def text(self) -> str:
+        return "\n".join(self._lines)
+
+
 def _move_to_reviewed(plan_path: Path) -> Path:
     """Move a plan file from working/ to reviewed/. Returns the new path."""
     try:
@@ -227,11 +252,13 @@ def _resolve_cli_path() -> str | None:
 def _build_claude_options(cwd: str, model: str | None, max_turns: int):
     from claude_agent_sdk import ClaudeAgentOptions
 
+    stderr_buf = _StderrBuffer()
     options = ClaudeAgentOptions(
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         permission_mode="default",
         cwd=cwd,
         max_turns=max_turns,
+        stderr=stderr_buf,
     )
     if model:
         options.model = model
@@ -243,7 +270,7 @@ def _build_claude_options(cwd: str, model: str | None, max_turns: int):
     api_key = _resolve_anthropic_api_key()
     if api_key:
         options.env = {**(options.env or {}), "ANTHROPIC_API_KEY": api_key}
-    return options
+    return options, stderr_buf
 
 
 async def run_resolve_session(
@@ -313,7 +340,7 @@ async def run_resolve_session(
         )
 
         try:
-            options = _build_claude_options(cwd, model, max_turns)
+            options, stderr_buf = _build_claude_options(cwd, model, max_turns)
         except Exception as e:
             _show_error(
                 "ClaudeAgentOptions 구성 실패",
@@ -348,11 +375,11 @@ async def run_resolve_session(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _show_error(
-                "Resolve 세션 오류",
-                f"플랜 처리 중 오류 (파일: {plan_path.name}):",
-                e,
-            )
+            summary = f"플랜 처리 중 오류 (파일: {plan_path.name}):"
+            stderr_text = stderr_buf.text()
+            if stderr_text:
+                summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+            _show_error("Resolve 세션 오류", summary, e)
             display.on_error(f"Error resolving {plan_path.name}: {e}")
 
 
@@ -406,7 +433,7 @@ async def _run_resolve_session_batched(
     )
 
     try:
-        options = _build_claude_options(cwd, model, max_turns)
+        options, stderr_buf = _build_claude_options(cwd, model, max_turns)
     except Exception as e:
         _show_error(
             "ClaudeAgentOptions 구성 실패",
@@ -449,9 +476,9 @@ async def _run_resolve_session_batched(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        _show_error(
-            "Resolve 세션 오류",
-            f"일괄 플랜 처리 중 오류 ({len(valid)}개):",
-            e,
-        )
+        summary = f"일괄 플랜 처리 중 오류 ({len(valid)}개):"
+        stderr_text = stderr_buf.text()
+        if stderr_text:
+            summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+        _show_error("Resolve 세션 오류", summary, e)
         display.on_error(f"Error resolving batch: {e}")

@@ -18,6 +18,6 @@ echo === Building with PyInstaller ===
 if errorlevel 1 exit /b %errorlevel%
 
 echo.
-echo === Done: dist\PlanFinder.exe ===
+echo === Done: dist\PlanFinder\PlanFinder.exe ===
 
 endlocal

@@ -42,6 +42,14 @@ async def discover_plan(
 
     target_dir = cwd or os.getcwd()
 
+    from .executor import (
+        _StderrBuffer,
+        _resolve_anthropic_api_key,
+        _resolve_cli_path,
+        _show_error,
+    )
+
+    stderr_buf = _StderrBuffer()
     options = ClaudeAgentOptions(
         allowed_tools=["Read", "Glob", "Grep", "WebSearch"],
         permission_mode="bypassPermissions",
@@ -56,6 +64,7 @@ async def discover_plan(
             "and WebSearch. Do NOT modify any files. Your goal is to analyze "
             "the codebase and produce a structured improvement plan."
         ),
+        stderr=stderr_buf,
     )
 
     if model:
@@ -63,8 +72,6 @@ async def discover_plan(
 
     if resume_session_id:
         options.resume = resume_session_id
-
-    from .executor import _resolve_anthropic_api_key, _resolve_cli_path, _show_error
     try:
         cli_path = _resolve_cli_path()
         if cli_path:
@@ -132,11 +139,11 @@ async def discover_plan(
     except (asyncio.TimeoutError, asyncio.CancelledError):
         raise
     except Exception as e:
-        _show_error(
-            "Discovery 쿼리 오류",
-            "discover_plan 실행 중 예외가 발생했습니다.",
-            e,
-        )
+        summary = "discover_plan 실행 중 예외가 발생했습니다."
+        stderr_text = stderr_buf.text()
+        if stderr_text:
+            summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+        _show_error("Discovery 쿼리 오류", summary, e)
         raise
 
 
