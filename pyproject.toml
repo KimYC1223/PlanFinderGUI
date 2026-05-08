@@ -1,6 +1,6 @@
 [project]
 name = "plan-finder-gui"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Cross-platform GUI for the plan-finder AI code improvement tool"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,8 +21,17 @@ plan-finder-gui = "plan_finder_gui.main:main"
 build = ["pyinstaller>=6.0"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+local_scheme = "no-local-version"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/plan_finder_gui/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/plan_finder_gui"]

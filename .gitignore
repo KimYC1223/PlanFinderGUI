@@ -19,6 +19,9 @@ dist/
 # PyInstaller
 *.manifest
 
+# hatch-vcs generated version file
+src/plan_finder_gui/_version.py
+
 # macOS
 .DS_Store
 .AppleDouble
