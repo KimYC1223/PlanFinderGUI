@@ -697,6 +697,12 @@ class MainWindow(QMainWindow):
             # UI desync between the running session and the report browser.
             self._locked_project_dir = self.config_panel.project_dir_edit.text()
             self.config_panel.set_project_dir_locked(True)
+        # Disable the Start button to prevent concurrent sessions on the same
+        # project, which would cause StateManager race conditions and data loss.
+        self.config_panel.start_btn.setEnabled(False)
+        self.config_panel.start_btn.setToolTip(
+            "Cannot start a new session while another is running"
+        )
         self.config_panel.stop_btn.setEnabled(True)
 
     def _on_session_unregistered(self, session: Session) -> None:
@@ -707,6 +713,9 @@ class MainWindow(QMainWindow):
             self.report_browser.set_running(False)
             self.report_browser.refresh()
             self.config_panel.stop_btn.setEnabled(False)
+            # Re-enable the Start button now that all sessions have finished.
+            self.config_panel.start_btn.setEnabled(True)
+            self.config_panel.start_btn.setToolTip("")
             if self._tray is not None:
                 self._tray.setIcon(self._tray_icon_idle)
             # Unlock the project directory now that all sessions have finished.
