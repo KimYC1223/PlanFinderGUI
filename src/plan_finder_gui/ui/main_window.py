@@ -59,6 +59,10 @@ class MainWindow(QMainWindow):
         # close). Lets closeEvent skip the "send to tray?" prompt.
         self._force_quit: bool = False
 
+        # Stores the project directory when sessions start. While sessions are
+        # running, the project directory input is locked to prevent UI desync.
+        self._locked_project_dir: str | None = None
+
         self.setStyleSheet("QMainWindow { background: #1e1e1e; }")
         self._build_menu()
         self._build_ui()
@@ -689,6 +693,10 @@ class MainWindow(QMainWindow):
             self.report_browser.set_running(True)
             if self._tray is not None:
                 self._tray.setIcon(self._tray_icon_running)
+            # Lock the project directory while sessions are running to prevent
+            # UI desync between the running session and the report browser.
+            self._locked_project_dir = self.config_panel.project_dir_edit.text()
+            self.config_panel.set_project_dir_locked(True)
         self.config_panel.stop_btn.setEnabled(True)
 
     def _on_session_unregistered(self, session: Session) -> None:
@@ -701,6 +709,9 @@ class MainWindow(QMainWindow):
             self.config_panel.stop_btn.setEnabled(False)
             if self._tray is not None:
                 self._tray.setIcon(self._tray_icon_idle)
+            # Unlock the project directory now that all sessions have finished.
+            self.config_panel.set_project_dir_locked(False)
+            self._locked_project_dir = None
 
     def _on_session_task_done(self, session: Session, task: asyncio.Task) -> None:
         is_resolve = bool(getattr(session, "is_resolve", False))

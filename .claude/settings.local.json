@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem C:\\\\Users\\\\DEVSISTERS\\\\PlanFinderGUI\\\\src\\\\plan_finder_gui\\\\ -Recurse -File | Where-Object { $_.Extension -in '.py','.md','.json','.yaml','.yml','.txt' } | Select-Object FullName)"
+    ]
+  }
+}

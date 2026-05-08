@@ -94,16 +94,17 @@ class ConfigPanel(QWidget):
         self.project_dir_edit.setPlaceholderText("/경로/프로젝트")
         self.project_dir_edit.setFixedHeight(_INPUT_H)
         _style_input(self.project_dir_edit)
-        browse_btn = QPushButton("…")
-        browse_btn.setFixedWidth(28)
-        browse_btn.setFixedHeight(_INPUT_H)
-        browse_btn.setStyleSheet(
+        self.browse_btn = QPushButton("…")
+        self.browse_btn.setFixedWidth(28)
+        self.browse_btn.setFixedHeight(_INPUT_H)
+        self.browse_btn.setStyleSheet(
             "QPushButton { background: #333; color: #ccc; border-radius: 3px; }"
             "QPushButton:hover { background: #444; }"
+            "QPushButton:disabled { background: #2a2a2a; color: #555; }"
         )
-        browse_btn.clicked.connect(self._browse_project)
+        self.browse_btn.clicked.connect(self._browse_project)
         dir_row.addWidget(self.project_dir_edit)
-        dir_row.addWidget(browse_btn)
+        dir_row.addWidget(self.browse_btn)
 
         proj_form.addRow(_label("디렉토리"), _wrap(dir_row))
         proj_group.layout().addLayout(proj_form)
@@ -461,6 +462,26 @@ class ConfigPanel(QWidget):
         if path:
             self.project_dir_edit.setText(path)
 
+    def set_project_dir_locked(self, locked: bool) -> None:
+        """Enable or disable the project directory input and browse button.
+
+        When locked, the user cannot change the project directory. This prevents
+        UI desync where the report browser shows a different project than the
+        one being processed by an active session.
+        """
+        self.project_dir_edit.setEnabled(not locked)
+        self.browse_btn.setEnabled(not locked)
+        if locked:
+            self.project_dir_edit.setToolTip(
+                "Cannot change project directory while session is running"
+            )
+            self.browse_btn.setToolTip(
+                "Cannot change project directory while session is running"
+            )
+        else:
+            self.project_dir_edit.setToolTip("")
+            self.browse_btn.setToolTip("")
+
     # ------------------------------------------------------------------ #
     #  Preset handling                                                     #
     # ------------------------------------------------------------------ #
@@ -561,6 +582,7 @@ def _style_input(w: QLineEdit) -> None:
         "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #444;"
         "border-radius: 4px; padding: 3px 6px; font-size: 12px; }"
         "QLineEdit:focus { border-color: #0e78d5; }"
+        "QLineEdit:disabled { background: #262626; color: #666; }"
     )
 
 
