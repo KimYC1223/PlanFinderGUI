@@ -94,7 +94,10 @@ async def discover_plan(
             e,
         )
 
+    last_result_subtype: str | None = None
+
     async def _run_query() -> DiscoveryResult:
+        nonlocal last_result_subtype
         plan: DiscoveredPlan | None = None
         cost: float = 0.0
         tokens: int = 0
@@ -116,6 +119,7 @@ async def discover_plan(
                 if has_tool_use:
                     turns += 1
             elif isinstance(message, ResultMessage):
+                last_result_subtype = message.subtype
                 cost = message.total_cost_usd or 0.0
                 session_id = message.session_id
                 if message.usage:
@@ -151,10 +155,23 @@ async def discover_plan(
             summary += f"\n\nClaude CLI 경로: {resolved_cli}"
         if model:
             summary += f"\n모델: {model}"
+        # The CLI exits with code 1 for non-success ResultMessage subtypes
+        # (e.g. error_max_turns). The SDK turns that into an opaque "Command
+        # failed" exception with empty stderr — show the actual subtype
+        # we captured during iteration instead.
+        if last_result_subtype and last_result_subtype != "success":
+            summary += (
+                f"\n\n실패 원인 (ResultMessage.subtype): {last_result_subtype}"
+            )
+            if last_result_subtype == "error_max_turns":
+                summary += (
+                    f"\n→ 최대 턴({max_turns})을 초과했습니다. 환경설정에서 "
+                    f"'최대 턴' 값을 늘려보세요."
+                )
         stderr_text = stderr_buf.text()
         if stderr_text:
             summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
-        else:
+        elif not last_result_subtype:
             summary += (
                 "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
                 "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."

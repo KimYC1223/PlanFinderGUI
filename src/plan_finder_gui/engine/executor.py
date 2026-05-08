@@ -363,6 +363,7 @@ async def run_resolve_session(
 
         display.log(f"Resolving: {plan_path.name}")
 
+        last_result_subtype: str | None = None
         try:
             from .tool_summary import summarize_tool
 
@@ -375,6 +376,7 @@ async def run_resolve_session(
                             if callable(on_activity):
                                 on_activity(detail)
                 elif isinstance(message, ResultMessage):
+                    last_result_subtype = message.subtype
                     if message.subtype == "success":
                         try:
                             plan_path = _move_to_reviewed(plan_path)
@@ -392,10 +394,23 @@ async def run_resolve_session(
             except Exception:
                 pass
             summary = f"플랜 처리 중 오류 (파일: {plan_path.name}):"
+            # The CLI exits with code 1 for non-success ResultMessage subtypes
+            # (e.g. error_max_turns). The SDK turns that into an opaque
+            # "Command failed" exception with empty stderr — show the actual
+            # subtype we captured during iteration instead.
+            if last_result_subtype and last_result_subtype != "success":
+                summary += (
+                    f"\n\n실패 원인 (ResultMessage.subtype): {last_result_subtype}"
+                )
+                if last_result_subtype == "error_max_turns":
+                    summary += (
+                        f"\n→ 최대 턴({max_turns})을 초과했습니다. 환경설정에서 "
+                        f"'최대 턴' 값을 늘려보세요."
+                    )
             stderr_text = stderr_buf.text()
             if stderr_text:
                 summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
-            else:
+            elif not last_result_subtype:
                 summary += (
                     "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
                     "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."
@@ -466,6 +481,7 @@ async def _run_resolve_session_batched(
     names = ", ".join(p.name for p, _ in valid)
     display.log(f"Resolving (일괄, {len(valid)}개): {names}")
 
+    last_result_subtype: str | None = None
     try:
         from .tool_summary import summarize_tool
 
@@ -478,6 +494,7 @@ async def _run_resolve_session_batched(
                         if callable(on_activity):
                             on_activity(detail)
             elif isinstance(message, ResultMessage):
+                last_result_subtype = message.subtype
                 if message.subtype == "success":
                     moved: list[Path] = []
                     for path, _ in valid:
@@ -502,10 +519,19 @@ async def _run_resolve_session_batched(
         except Exception:
             pass
         summary = f"일괄 플랜 처리 중 오류 ({len(valid)}개):"
+        if last_result_subtype and last_result_subtype != "success":
+            summary += (
+                f"\n\n실패 원인 (ResultMessage.subtype): {last_result_subtype}"
+            )
+            if last_result_subtype == "error_max_turns":
+                summary += (
+                    f"\n→ 최대 턴({max_turns})을 초과했습니다. 환경설정에서 "
+                    f"'최대 턴' 값을 늘려보세요."
+                )
         stderr_text = stderr_buf.text()
         if stderr_text:
             summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
-        else:
+        elif not last_result_subtype:
             summary += (
                 "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
                 "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."
