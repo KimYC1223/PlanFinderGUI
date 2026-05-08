@@ -147,7 +147,13 @@ async def _maybe_auto_commit(plan_path: Path, cwd: str, display) -> None:
             display.log(f"커밋 메시지 생성 중... ({lang}, Anthropic API 사용)")
         else:
             display.log(f"커밋 메시지 생성 중... ({lang}, 로컬 Claude CLI 사용)")
-        commit_msg = await generate_commit_message(title, lang, cwd)
+        try:
+            commit_msg = await generate_commit_message(title, lang, cwd)
+        except Exception as e:
+            display.log(
+                f"커밋 메시지 생성 실패, 플랜 제목으로 대체: {e}"
+            )
+            commit_msg = title
         display.log(f"커밋 메시지: {commit_msg}")
 
         display.log("git add + commit 실행 중...")
@@ -194,7 +200,13 @@ async def _maybe_auto_commit_batch(plan_paths: list[Path], cwd: str, display) ->
             display.log(f"커밋 메시지 생성 중... ({lang}, {len(titles)}개 묶음, Anthropic API 사용)")
         else:
             display.log(f"커밋 메시지 생성 중... ({lang}, {len(titles)}개 묶음, 로컬 Claude CLI 사용)")
-        commit_msg = await generate_batch_commit_message(titles, lang, cwd)
+        try:
+            commit_msg = await generate_batch_commit_message(titles, lang, cwd)
+        except Exception as e:
+            display.log(
+                f"커밋 메시지 생성 실패, 플랜 제목으로 대체: {e}"
+            )
+            commit_msg = "\n\n".join(f"- {t}" for t in titles)
         display.log(f"커밋 메시지: {commit_msg}")
 
         display.log("git add + commit 실행 중...")
@@ -375,10 +387,19 @@ async def run_resolve_session(
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            try:
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
             summary = f"플랜 처리 중 오류 (파일: {plan_path.name}):"
             stderr_text = stderr_buf.text()
             if stderr_text:
                 summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+            else:
+                summary += (
+                    "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
+                    "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."
+                )
             _show_error("Resolve 세션 오류", summary, e)
             display.on_error(f"Error resolving {plan_path.name}: {e}")
 
@@ -476,9 +497,18 @@ async def _run_resolve_session_batched(
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        try:
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
         summary = f"일괄 플랜 처리 중 오류 ({len(valid)}개):"
         stderr_text = stderr_buf.text()
         if stderr_text:
             summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+        else:
+            summary += (
+                "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
+                "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."
+            )
         _show_error("Resolve 세션 오류", summary, e)
         display.on_error(f"Error resolving batch: {e}")

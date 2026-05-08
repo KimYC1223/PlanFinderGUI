@@ -139,10 +139,26 @@ async def discover_plan(
     except (asyncio.TimeoutError, asyncio.CancelledError):
         raise
     except Exception as e:
+        # Give the SDK's detached stderr reader a moment to drain any final
+        # lines into stderr_buf before we snapshot it for the error report.
+        try:
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
         summary = "discover_plan 실행 중 예외가 발생했습니다."
+        resolved_cli = getattr(options, "cli_path", None)
+        if resolved_cli:
+            summary += f"\n\nClaude CLI 경로: {resolved_cli}"
+        if model:
+            summary += f"\n모델: {model}"
         stderr_text = stderr_buf.text()
         if stderr_text:
             summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
+        else:
+            summary += (
+                "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
+                "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."
+            )
         _show_error("Discovery 쿼리 오류", summary, e)
         raise
 

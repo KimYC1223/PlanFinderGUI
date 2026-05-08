@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
+
+
+_COMMIT_SYSTEM_PROMPT = (
+    "You are generating a single git commit message. Output only the "
+    "commit message itself — no explanations, no quotes, no prefixes."
+)
 
 
 def _resolve_api_key() -> str | None:
@@ -60,8 +67,8 @@ def _generate_via_sdk(prompt: str, api_key: str, max_tokens: int) -> str:
     return message.content[0].text.strip()
 
 
-async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
-    """Async path: drive the local `claude` CLI through claude_agent_sdk.
+async def _generate_via_cli_sdk(prompt: str, cwd: str | None) -> str:
+    """SDK-based async path: drive the local `claude` CLI through claude_agent_sdk.
 
     Used when the user hasn't configured an Anthropic API key — the CLI carries
     its own OAuth login so this still works without any credentials in
@@ -81,10 +88,7 @@ async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
         permission_mode="bypassPermissions",
         max_turns=1,
         cwd=cwd,
-        system_prompt=(
-            "You are generating a single git commit message. Output only the "
-            "commit message itself — no explanations, no quotes, no prefixes."
-        ),
+        system_prompt=_COMMIT_SYSTEM_PROMPT,
         stderr=stderr_buf,
     )
 
@@ -112,6 +116,82 @@ async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
             ) from e
         raise
     return "".join(parts).strip()
+
+
+def _generate_via_cli_subprocess(prompt: str, cwd: str | None) -> str:
+    """Sync fallback: invoke `claude --print` directly via subprocess.
+
+    The SDK transport's stderr reader uses TextReceiveStream which decodes
+    as UTF-8 and silently drops non-UTF-8 lines via ``except Exception:
+    pass``. On Windows that hides the real failure behind a generic
+    "Check stderr output for details". This path bypasses the SDK so we
+    can capture stderr ourselves and either recover (if the CLI works
+    when invoked directly) or surface the real error.
+    """
+    from .executor import _resolve_cli_path
+
+    cli_path = _resolve_cli_path() or shutil.which("claude")
+    if not cli_path:
+        raise RuntimeError("claude CLI binary not found on PATH")
+
+    cmd = [
+        cli_path,
+        "--print",
+        "--max-turns", "1",
+        "--permission-mode", "bypassPermissions",
+        "--system-prompt", _COMMIT_SYSTEM_PROMPT,
+        prompt,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"claude CLI not executable: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("claude CLI timed out after 60s") from e
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip() or "(no stderr output)"
+        stdout = (result.stdout or "").strip()
+        msg = (
+            f"claude CLI exited with code {result.returncode}\n"
+            f"stderr:\n{stderr}"
+        )
+        if stdout:
+            msg += f"\n\nstdout:\n{stdout}"
+        raise RuntimeError(msg)
+
+    return (result.stdout or "").strip()
+
+
+async def _generate_via_cli(prompt: str, cwd: str | None) -> str:
+    """Generate a commit message via the local Claude CLI.
+
+    Tries the SDK-based async path first; on failure falls back to a
+    direct ``subprocess.run`` call. The fallback both recovers (if the
+    CLI works when invoked directly) and surfaces the real stderr the
+    SDK transport swallowed.
+    """
+    try:
+        return await _generate_via_cli_sdk(prompt, cwd)
+    except Exception as sdk_err:
+        try:
+            result = await asyncio.to_thread(
+                _generate_via_cli_subprocess, prompt, cwd
+            )
+        except Exception as sub_err:
+            raise RuntimeError(
+                f"SDK path failed: {sdk_err}\n\n"
+                f"Direct subprocess fallback also failed: {sub_err}"
+            ) from sub_err
+        return result
 
 
 async def generate_commit_message(
