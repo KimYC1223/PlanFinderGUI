@@ -109,8 +109,81 @@ class Session(QObject):
     def cancel(self) -> bool:
         if self.task and not self.task.done():
             self.task.cancel()
+            self.terminate_procs()
             return True
         return False
+
+    def terminate_procs(self, timeout: float = 5.0) -> None:
+        """Terminate all subprocesses owned by this session.
+
+        First sends SIGTERM (terminate) to each process and waits up to
+        ``timeout`` seconds for graceful exit. Any processes still running
+        after the timeout are forcibly killed (SIGKILL).
+
+        Args:
+            timeout: Maximum seconds to wait for graceful termination.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+
+        procs_to_terminate = list(self._procs.values())
+        if not procs_to_terminate:
+            return
+
+        # Phase 1: Send SIGTERM to all processes
+        for proc in procs_to_terminate:
+            try:
+                if proc.is_running():
+                    proc.terminate()
+            except psutil.NoSuchProcess:
+                # Process already exited
+                pass
+            except psutil.AccessDenied:
+                # Cannot terminate (elevated privileges required)
+                import logging
+                logging.warning(
+                    f"Access denied when terminating PID {proc.pid}; "
+                    "may require elevated privileges"
+                )
+            except Exception as e:
+                import logging
+                logging.warning(f"Error terminating PID {proc.pid}: {e}")
+
+        # Phase 2: Wait for graceful termination
+        still_alive = []
+        deadline = time.time() + timeout
+        for proc in procs_to_terminate:
+            try:
+                remaining = max(0.0, deadline - time.time())
+                proc.wait(timeout=remaining)
+            except psutil.TimeoutExpired:
+                still_alive.append(proc)
+            except psutil.NoSuchProcess:
+                pass
+            except Exception:
+                pass
+
+        # Phase 3: Force kill any processes that didn't exit gracefully
+        for proc in still_alive:
+            try:
+                if proc.is_running():
+                    proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.AccessDenied:
+                import logging
+                logging.warning(
+                    f"Access denied when killing PID {proc.pid}; "
+                    "process may still be running"
+                )
+            except Exception as e:
+                import logging
+                logging.warning(f"Error killing PID {proc.pid}: {e}")
+
+        # Clear the process tracking dict
+        self._procs.clear()
 
 
 class SessionManager(QObject):
@@ -158,6 +231,8 @@ class SessionManager(QObject):
         self.session_state_changed.emit(session)
 
     def unregister(self, session: Session) -> None:
+        # Terminate any lingering subprocesses before cleanup
+        session.terminate_procs(timeout=2.0)
         self._sessions.pop(session.id, None)
         for pid in session.claimed_pids():
             self._claimed_pids.discard(pid)
@@ -169,7 +244,16 @@ class SessionManager(QObject):
     def any_running(self) -> bool:
         return any(s.state == "running" for s in self._sessions.values())
 
-    def cancel_all(self) -> int:
+    def cancel_all(self, wait_for_termination: bool = True) -> int:
+        """Cancel all running sessions and terminate their subprocesses.
+
+        Args:
+            wait_for_termination: If True, blocks briefly while subprocesses
+                are terminated. If False, termination happens asynchronously.
+
+        Returns:
+            Number of sessions that were cancelled.
+        """
         cancelled = 0
         for s in self._sessions.values():
             if s.cancel():
