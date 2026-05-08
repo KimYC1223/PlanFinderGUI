@@ -96,6 +96,54 @@ def main() -> None:
 
     QTimer.singleShot(1500, _check_for_updates)
 
+    def _check_cli_version() -> None:
+        import re
+        import subprocess
+
+        from .engine.executor import _resolve_cli_path
+
+        try:
+            from claude_agent_sdk._cli_version import __cli_version__ as required_version
+        except ImportError:
+            return
+
+        cli = _resolve_cli_path() or "claude"
+        try:
+            result = subprocess.run(
+                [cli, "-v"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            output = result.stdout.strip() or result.stderr.strip()
+        except Exception:
+            return
+
+        match = re.search(r"(\d+\.\d+\.\d+)", output)
+        if not match:
+            return
+
+        installed = match.group(1)
+        installed_parts = [int(x) for x in installed.split(".")]
+        required_parts = [int(x) for x in required_version.split(".")]
+
+        if installed_parts < required_parts:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(window)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Claude CLI 버전 업데이트 필요")
+            box.setText(
+                f"설치된 Claude CLI 버전이 너무 낮습니다.\n\n"
+                f"현재: {installed}\n"
+                f"필요: {required_version} 이상\n\n"
+                "일부 기능이 정상 동작하지 않을 수 있습니다.\n"
+                "터미널에서 아래 명령어로 업데이트하세요:\n\n"
+                "npm update -g @anthropic-ai/claude-code"
+            )
+            box.exec()
+
+    QTimer.singleShot(800, _check_cli_version)
+
     with loop:
         loop.run_forever()
 
