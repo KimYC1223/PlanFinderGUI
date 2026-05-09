@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import logging
 import os
 import shutil
 import traceback
@@ -59,24 +60,63 @@ class _StderrBuffer:
         return "\n".join(self._lines)
 
 
+_logger = logging.getLogger(__name__)
+
+
 def _move_to_reviewed(plan_path: Path) -> Path:
-    """Move a plan file from working/ to reviewed/. Returns the new path."""
+    """Move a plan file from working/ to reviewed/ transactionally.
+
+    This function collects all files (main plan + translations) before moving
+    any of them. If any move fails, it attempts to rollback previously-moved
+    files to their original locations to prevent orphaned translation files.
+
+    Returns the new path of the main plan file.
+    """
+    # Collect all files to move: list of (source, destination) tuples
+    files_to_move: list[tuple[Path, Path]] = []
+    moved_files: list[tuple[Path, Path]] = []  # (destination, original) for rollback
+
     try:
         reviewed_dir = plan_path.parent.parent / "reviewed"
         reviewed_dir.mkdir(parents=True, exist_ok=True)
         dest = reviewed_dir / plan_path.name
-        plan_path.rename(dest)
 
-        # Move any translated versions alongside
+        # Add main plan file
+        files_to_move.append((plan_path, dest))
+
+        # Collect translation files
         trans_dir = plan_path.parent / "translated"
         if trans_dir.is_dir():
             dest_trans_dir = reviewed_dir / "translated"
-            dest_trans_dir.mkdir(exist_ok=True)
             stem = plan_path.stem
             for trans_file in trans_dir.glob(f"{stem}.*.md"):
-                trans_file.rename(dest_trans_dir / trans_file.name)
+                trans_dest = dest_trans_dir / trans_file.name
+                files_to_move.append((trans_file, trans_dest))
+
+        # Dry-run validation: check all source files exist
+        for src, _ in files_to_move:
+            if not src.exists():
+                raise FileNotFoundError(f"Source file does not exist: {src}")
+
+        # Create destination directories
+        dest_trans_dir = reviewed_dir / "translated"
+        if any(dst.parent == dest_trans_dir for _, dst in files_to_move):
+            dest_trans_dir.mkdir(exist_ok=True)
+
+        # Move files one by one, tracking successful moves for rollback
+        for src, dst in files_to_move:
+            try:
+                src.rename(dst)
+                moved_files.append((dst, src))  # Track for potential rollback
+            except Exception as move_error:
+                # Move failed - attempt rollback of previously moved files
+                _rollback_moves(moved_files)
+                raise RuntimeError(
+                    f"Failed to move {src} -> {dst}: {move_error}"
+                ) from move_error
 
         return dest
+
     except Exception as e:
         _show_error(
             "리뷰 폴더 이동 실패",
@@ -84,6 +124,34 @@ def _move_to_reviewed(plan_path: Path) -> Path:
             e,
         )
         raise
+
+
+def _rollback_moves(moved_files: list[tuple[Path, Path]]) -> None:
+    """Attempt to restore moved files to their original locations.
+
+    Args:
+        moved_files: List of (current_path, original_path) tuples for files
+                     that were successfully moved and need to be restored.
+    """
+    rollback_failures: list[str] = []
+
+    for current_path, original_path in reversed(moved_files):
+        try:
+            if current_path.exists():
+                # Ensure original parent directory exists
+                original_path.parent.mkdir(parents=True, exist_ok=True)
+                current_path.rename(original_path)
+        except Exception as rollback_error:
+            rollback_failures.append(
+                f"  {current_path} -> {original_path}: {rollback_error}"
+            )
+
+    if rollback_failures:
+        _logger.warning(
+            "Partial rollback failure during move_to_reviewed. "
+            "Some files could not be restored to their original locations:\n%s",
+            "\n".join(rollback_failures),
+        )
 
 
 def _get_work_lang() -> str:
