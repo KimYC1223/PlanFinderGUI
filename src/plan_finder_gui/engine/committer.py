@@ -226,8 +226,32 @@ async def generate_batch_commit_message(
     return await _generate_via_cli(prompt, cwd)
 
 
+def _unstage_changes(cwd: str, timeout: float = 10.0) -> bool:
+    """Unstage all staged changes via `git reset HEAD`.
+
+    Returns True if unstaging succeeded, False otherwise.
+    Uses a timeout to avoid hanging on corrupted repos.
+    """
+    try:
+        reset_result = subprocess.run(
+            ["git", "reset", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return reset_result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return False
+
+
 def git_commit(cwd: str, message: str) -> tuple[bool, str]:
-    """Stage all changes and create a git commit. Returns (success, output)."""
+    """Stage all changes and create a git commit. Returns (success, output).
+
+    If the commit fails after staging, attempts to unstage the changes
+    to leave the repository in a clean state.
+    """
+    staged_by_us = False
     try:
         add_result = subprocess.run(
             ["git", "add", "-A"],
@@ -238,12 +262,16 @@ def git_commit(cwd: str, message: str) -> tuple[bool, str]:
         if add_result.returncode != 0:
             return False, f"git add 실패: {add_result.stderr.strip()}"
 
+        staged_by_us = True
+
         status_result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=cwd,
             capture_output=True,
         )
         if status_result.returncode == 0:
+            # No changes to commit - nothing was actually staged
+            staged_by_us = False
             return False, "커밋할 변경사항 없음"
 
         commit_result = subprocess.run(
@@ -253,12 +281,23 @@ def git_commit(cwd: str, message: str) -> tuple[bool, str]:
             text=True,
         )
         if commit_result.returncode != 0:
-            return False, f"git commit 실패: {commit_result.stderr.strip()}"
+            stderr = commit_result.stderr.strip()
+            # Commit failed - attempt to unstage changes to restore clean state
+            if _unstage_changes(cwd):
+                return False, f"git commit 실패 (변경사항 unstage됨): {stderr}"
+            else:
+                return False, f"git commit 실패 (unstage도 실패): {stderr}"
 
         return True, commit_result.stdout.strip()
     except FileNotFoundError:
+        # git binary not found - if we staged, try to unstage
+        if staged_by_us:
+            _unstage_changes(cwd)
         return False, "git을 찾을 수 없음"
     except Exception as e:
+        # Unexpected error - if we staged, try to unstage
+        if staged_by_us:
+            _unstage_changes(cwd)
         return False, str(e)
 
 

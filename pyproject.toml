@@ -39,4 +39,5 @@ packages = ["src/plan_finder_gui"]
 [dependency-groups]
 dev = [
     "pillow>=12.2.0",
+    "pytest>=8.0.0",
 ]
