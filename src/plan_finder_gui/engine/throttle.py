@@ -155,6 +155,7 @@ class SessionThrottle:
         self.cumulative_tokens: int = 0
         self.model: str | None = None
         self.session_ready: bool = False
+        self.last_error: str | None = None
         self._log = log_fn or (lambda _: None)
         if not _skip_init:
             self._init_session()
@@ -196,25 +197,53 @@ class SessionThrottle:
         )
 
     def _init_session(self) -> None:
-        """Synchronous session initialization (blocks for up to 30s)."""
+        """Synchronous session initialization (blocks for up to 30s).
+
+        Catches both NoActiveSession and CcusageNotInstalled to gracefully
+        disable throttling rather than crashing the discovery loop.
+        """
         try:
             session_info = detect_session()
-        except NoActiveSession:
+        except NoActiveSession as e:
             self.session_ready = False
+            self.last_error = str(e)
             self._log("No active session yet — throttle disabled until session starts.")
             return
+        except CcusageNotInstalled as e:
+            self.session_ready = False
+            self.last_error = str(e)
+            self._log(
+                "ccusage became unavailable — throttle disabled. "
+                "Check PATH or reinstall ccusage."
+            )
+            return
 
+        self.last_error = None
         self._apply_session_info(session_info)
 
     async def _init_session_async(self) -> None:
-        """Async session initialization (non-blocking)."""
+        """Async session initialization (non-blocking).
+
+        Catches both NoActiveSession and CcusageNotInstalled to gracefully
+        disable throttling rather than crashing the discovery loop.
+        """
         try:
             session_info = await detect_session_async()
-        except NoActiveSession:
+        except NoActiveSession as e:
             self.session_ready = False
+            self.last_error = str(e)
             self._log("No active session yet — throttle disabled until session starts.")
             return
+        except CcusageNotInstalled as e:
+            self.session_ready = False
+            self.last_error = str(e)
+            self._log(
+                "ccusage became unavailable — throttle disabled. "
+                "Check PATH or reinstall ccusage."
+            )
+            return
 
+        self.last_error = None
         self._apply_session_info(session_info)
 
     def reinit(self) -> None:
