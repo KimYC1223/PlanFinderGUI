@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .fileutil import atomic_write
 from .models import DiscoveredPlan
+
+logger = logging.getLogger(__name__)
 
 
 EXISTING_PLAN_DIRS: tuple[str, ...] = ("pending", "working", "reviewed", "reject")
@@ -43,7 +47,8 @@ def scan_existing_plans(report_dir: Path) -> list[ExistingPlanSummary]:
     """Read filenames in pending/working/reviewed/reject and extract keyword+title.
 
     Does NOT open files — only globs filenames. Translated companions
-    (`*.XX.md`) are skipped.
+    (`*.XX.md`) are skipped. Files that fail to parse are logged and skipped
+    rather than causing a crash.
     """
     out: list[ExistingPlanSummary] = []
     for status in EXISTING_PLAN_DIRS:
@@ -51,10 +56,18 @@ def scan_existing_plans(report_dir: Path) -> list[ExistingPlanSummary]:
         if not cat_dir.is_dir():
             continue
         for f in sorted(cat_dir.glob("*.md")):
-            if _is_translated_stem(f.stem):
-                continue
-            keyword, title = _parse_plan_filename(f.stem)
-            out.append(ExistingPlanSummary(status=status, keyword=keyword, title=title))
+            try:
+                if _is_translated_stem(f.stem):
+                    continue
+                keyword, title = _parse_plan_filename(f.stem)
+                out.append(ExistingPlanSummary(status=status, keyword=keyword, title=title))
+            except Exception as e:
+                # Skip files that fail to parse, logging a warning
+                logger.warning(
+                    "Skipping plan file %s due to parse error: %s",
+                    f,
+                    e,
+                )
     return out
 
 
@@ -115,9 +128,12 @@ def save_plan(
     *,
     pending: bool = False,
 ) -> Path:
-    """Save a plan as a markdown file. Returns the file path.
+    """Save a plan as a markdown file atomically. Returns the file path.
 
     If pending=True, saves to report_dir/pending/ instead of report_dir/.
+
+    Uses atomic write (temp file + fsync + os.replace) to prevent corruption
+    if the process crashes during the write operation.
     """
     target_dir = report_dir / "pending" if pending else report_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +152,6 @@ def save_plan(
     filepath = target_dir / filename
 
     content = generate_markdown(plan, iteration, pending=pending)
-    filepath.write_text(content, encoding="utf-8")
+    atomic_write(filepath, content)
 
     return filepath

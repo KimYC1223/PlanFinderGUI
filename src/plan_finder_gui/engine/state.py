@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from .fileutil import atomic_write
 from .models import DiscoveredPlan, PlanFinderState, RejectionRecord
 
 
@@ -34,56 +33,12 @@ class StateManager:
             self._state = PlanFinderState()
         return self._state
 
-    def _atomic_write(self, file_path: Path, content: str) -> None:
-        """Write content to file atomically to prevent corruption on crash.
-
-        This method writes to a temporary file first, flushes to disk, then
-        atomically replaces the target file. This ensures the file is never
-        left in a partially-written state if the process crashes or power is lost.
-
-        Note: On some network filesystems, os.replace() may not be truly atomic.
-        """
-        temp_fd = None
-        temp_path = None
-        try:
-            # Create temp file in the same directory to ensure same filesystem
-            # (required for atomic os.replace)
-            temp_fd, temp_path = tempfile.mkstemp(
-                dir=file_path.parent,
-                prefix=".state_tmp_",
-                suffix=".json",
-            )
-            # Write content to temp file
-            with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
-                temp_fd = None  # fdopen takes ownership, prevent double-close
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-
-            # Atomically replace target file (atomic on POSIX and Windows)
-            os.replace(temp_path, file_path)
-            temp_path = None  # Success, prevent cleanup
-
-        except Exception:
-            # Clean up temp file on any failure
-            if temp_fd is not None:
-                try:
-                    os.close(temp_fd)
-                except OSError:
-                    pass
-            if temp_path is not None:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-            raise
-
     def save(self) -> None:
         if self._state is None:
             return
         self._state.last_run = datetime.now()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write(self.path, self._state.model_dump_json(indent=2))
+        atomic_write(self.path, self._state.model_dump_json(indent=2))
 
     @property
     def state(self) -> PlanFinderState:

@@ -272,13 +272,15 @@ async def run_discovery_loop(
                 break
 
             if auto:
+                # Update state first (atomic write) so duplicate-detection works
+                # even if the file write fails or process crashes between operations
+                state_mgr.add_pending(result.plan)
                 filepath = save_plan(result.plan, iteration, report_dir, pending=True)
                 if post_save_hook:
                     try:
                         post_save_hook(filepath)
                     except Exception:
                         pass
-                state_mgr.add_pending(result.plan)
                 session_pending += 1
                 display.on_plan_pending(result.plan, filepath)
             else:
@@ -287,8 +289,10 @@ async def run_discovery_loop(
                     action, feedback = await display.request_approval(current_plan, iteration)
 
                     if action == "approve":
-                        filepath = save_plan(current_plan, iteration, report_dir)
+                        # Update state first (atomic write) so duplicate-detection works
+                        # even if the file write fails or process crashes between operations
                         state_mgr.record_approval(current_plan)
+                        filepath = save_plan(current_plan, iteration, report_dir)
                         session_approved += 1
                         display.on_plan_approved(current_plan, filepath)
                         break

@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .fileutil import atomic_write
+
 
 def _anthropic_client():
     """Build an Anthropic SDK client using the user's API key when present."""
@@ -139,11 +141,14 @@ def save_translated(
 
     For example, given ``/reports/pending/plan.md`` and ``target_lang="ko"``,
     saves to ``/reports/pending/translated/plan.ko.md`` and returns that path.
+
+    Uses atomic write (temp file + fsync + os.replace) to prevent corruption
+    if the process crashes during the write operation.
     """
     stem = original_path.stem
     translated_name = f"{stem}.{target_lang}.md"
     translated_dir = original_path.parent / "translated"
     translated_dir.mkdir(exist_ok=True)
     translated_path = translated_dir / translated_name
-    translated_path.write_text(translated_text, encoding="utf-8")
+    atomic_write(translated_path, translated_text)
     return translated_path
