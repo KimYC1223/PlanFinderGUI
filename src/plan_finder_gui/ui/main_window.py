@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..engine.engine import run_discovery_loop
 from ..engine.session_manager import Session, SessionManager
-from ..engine.throttle import CcusageNotInstalled, SessionThrottle
+from ..engine.throttle import CcusageNotInstalled, NoActiveSession, SessionThrottle
 from .claude_session_panel import ClaudeSessionPanel
 from .config_panel import ConfigPanel
 from .gui_display import GuiDisplayAdapter
@@ -623,37 +623,52 @@ class MainWindow(QMainWindow):
 
         adapter = GuiDisplayAdapter(self)
 
-        # Build throttle (gracefully disable if ccusage not available)
-        throttle = None
-        if config["throttle_enabled"]:
-            try:
-                throttle = SessionThrottle(
-                    session_budget=config["budget"],
-                    log_fn=adapter.log,
-                )
-            except CcusageNotInstalled as e:
-                self.log_panel.append_log(str(e), "warn")
-                self.log_panel.append_log("Throttle disabled.", "warn")
+        # Create async wrapper that initializes throttle without blocking Qt event loop
+        async def run_with_async_throttle():
+            # Build throttle asynchronously (gracefully disable if ccusage not available)
+            throttle = None
+            throttle_enabled = config["throttle_enabled"]
+            if throttle_enabled:
+                try:
+                    throttle = await SessionThrottle.create_async(
+                        session_budget=config["budget"],
+                        log_fn=adapter.log,
+                    )
+                except CcusageNotInstalled as e:
+                    adapter.log(str(e))
+                    adapter.log("Throttle disabled.")
+                    throttle_enabled = False
+                except NoActiveSession as e:
+                    # Session detection failed but ccusage is installed
+                    # Create a throttle instance with session_ready=False
+                    adapter.log(str(e))
+                    throttle = SessionThrottle(
+                        session_budget=config["budget"],
+                        log_fn=adapter.log,
+                        _skip_init=True,
+                    )
+                    throttle.session_ready = False
+                    adapter.log("No active session yet — throttle disabled until session starts.")
 
-        coro = run_discovery_loop(
-            plan_prompt=config["prompt"],
-            display=adapter,
-            max_iterations=config["max_iter"],
-            cwd=config["project_dir"],
-            auto=True,  # always auto
-            throttle=throttle,
-            throttle_enabled=config["throttle_enabled"] and throttle is not None,
-            resume=not config["no_resume"],
-            stop_at=config["stop_at"],
-            model=config["model"] or None,
-            max_turns=config["max_turns"],
-            post_save_hook=post_save_hook,
-        )
+            await run_discovery_loop(
+                plan_prompt=config["prompt"],
+                display=adapter,
+                max_iterations=config["max_iter"],
+                cwd=config["project_dir"],
+                auto=True,  # always auto
+                throttle=throttle,
+                throttle_enabled=throttle_enabled and throttle is not None,
+                resume=not config["no_resume"],
+                stop_at=config["stop_at"],
+                model=config["model"] or None,
+                max_turns=config["max_turns"],
+                post_save_hook=post_save_hook,
+            )
 
         self._spawn_session(
             label="Discovery",
             adapter=adapter,
-            coro=coro,
+            coro=run_with_async_throttle(),
             is_resolve=False,
         )
 

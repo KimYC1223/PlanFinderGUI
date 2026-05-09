@@ -8,6 +8,7 @@ Session timing auto-detected via `ccusage blocks --json`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from collections.abc import Callable
@@ -24,32 +25,25 @@ class NoActiveSession(RuntimeError):
     """ccusage found no active session block."""
 
 
-def detect_session() -> dict:
-    """Auto-detect current session info from ccusage.
+def _run_ccusage_subprocess() -> subprocess.CompletedProcess:
+    """Run ccusage subprocess (blocking). Called from thread pool.
 
-    Returns dict with keys:
-      session_start: datetime (local)
-      session_end: datetime (local)
-      cost_usd: float (cost already spent in this session)
-      models: list[str] (models used in this session)
-
-    Raises CcusageNotInstalled if ccusage is missing.
-    Raises NoActiveSession if no active block found.
+    Raises FileNotFoundError if ccusage is missing.
+    Raises subprocess.TimeoutExpired if timeout exceeded.
     """
-    try:
-        json_result = subprocess.run(
-            ["ccusage", "blocks", "--json", "--active"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        raise CcusageNotInstalled(
-            "ccusage is required but not installed. Install it with: brew install ccusage"
-        )
-    except subprocess.TimeoutExpired:
-        raise NoActiveSession("ccusage timed out (30s). Skipping session detection.")
+    return subprocess.run(
+        ["ccusage", "blocks", "--json", "--active"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
+
+def _parse_ccusage_result(json_result: subprocess.CompletedProcess) -> dict:
+    """Parse ccusage subprocess result into session info dict.
+
+    Raises NoActiveSession if parsing fails or no active block found.
+    """
     if json_result.returncode != 0:
         raise NoActiveSession(
             f"ccusage exited with code {json_result.returncode}: {json_result.stderr.strip()[:200]}"
@@ -61,8 +55,8 @@ def detect_session() -> dict:
         raise NoActiveSession(
             f"ccusage returned malformed JSON: {json_result.stdout[:200]}"
         ) from e
-    active_block = None
 
+    active_block = None
     for block in data.get("blocks", []):
         if block.get("isActive"):
             active_block = block
@@ -87,27 +81,101 @@ def detect_session() -> dict:
     }
 
 
+async def detect_session_async() -> dict:
+    """Async auto-detect current session info from ccusage.
+
+    This function runs the blocking subprocess call in a thread pool
+    to avoid blocking the Qt event loop.
+
+    Returns dict with keys:
+      session_start: datetime (local)
+      session_end: datetime (local)
+      cost_usd: float (cost already spent in this session)
+      models: list[str] (models used in this session)
+
+    Raises CcusageNotInstalled if ccusage is missing.
+    Raises NoActiveSession if no active block found or timeout.
+    """
+    try:
+        json_result = await asyncio.to_thread(_run_ccusage_subprocess)
+    except FileNotFoundError:
+        raise CcusageNotInstalled(
+            "ccusage is required but not installed. Install it with: brew install ccusage"
+        )
+    except subprocess.TimeoutExpired:
+        raise NoActiveSession("ccusage timed out (30s). Skipping session detection.")
+
+    return _parse_ccusage_result(json_result)
+
+
+def detect_session() -> dict:
+    """Synchronous auto-detect current session info from ccusage.
+
+    WARNING: This function blocks the calling thread for up to 30 seconds.
+    Prefer detect_session_async() in async contexts.
+
+    Returns dict with keys:
+      session_start: datetime (local)
+      session_end: datetime (local)
+      cost_usd: float (cost already spent in this session)
+      models: list[str] (models used in this session)
+
+    Raises CcusageNotInstalled if ccusage is missing.
+    Raises NoActiveSession if no active block found.
+    """
+    try:
+        json_result = _run_ccusage_subprocess()
+    except FileNotFoundError:
+        raise CcusageNotInstalled(
+            "ccusage is required but not installed. Install it with: brew install ccusage"
+        )
+    except subprocess.TimeoutExpired:
+        raise NoActiveSession("ccusage timed out (30s). Skipping session detection.")
+
+    return _parse_ccusage_result(json_result)
+
+
 class SessionThrottle:
     def __init__(
         self,
         session_budget: float = DEFAULT_SESSION_BUDGET,
         log_fn: Callable[[str], None] | None = None,
+        *,
+        _skip_init: bool = False,
     ) -> None:
+        """Initialize SessionThrottle.
+
+        Args:
+            session_budget: Budget in USD for the session.
+            log_fn: Optional logging callback.
+            _skip_init: Internal flag to skip sync init for async factory.
+        """
         self.session_budget = session_budget
         self.cumulative_cost: float = 0.0
         self.cumulative_tokens: int = 0
         self.model: str | None = None
+        self.session_ready: bool = False
         self._log = log_fn or (lambda _: None)
-        self._init_session()
+        if not _skip_init:
+            self._init_session()
 
-    def _init_session(self) -> None:
-        try:
-            session_info = detect_session()
-        except NoActiveSession:
-            self.session_ready = False
-            self._log("No active session yet — throttle disabled until session starts.")
-            return
+    @classmethod
+    async def create_async(
+        cls,
+        session_budget: float = DEFAULT_SESSION_BUDGET,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> "SessionThrottle":
+        """Async factory to create SessionThrottle without blocking.
 
+        Use this instead of __init__ when creating SessionThrottle from
+        an async context to avoid blocking the event loop.
+        """
+        instance = cls(session_budget, log_fn, _skip_init=True)
+        await instance._init_session_async()
+        return instance
+
+    def _apply_session_info(self, session_info: dict) -> None:
+        """Apply session info dict to instance state."""
         self.session_ready = True
         self.session_start = session_info["session_start"]
         self.session_end = session_info["session_end"]
@@ -127,12 +195,45 @@ class SessionThrottle:
             f"${self.cumulative_cost:.2f}/${self.session_budget:.0f} spent"
         )
 
+    def _init_session(self) -> None:
+        """Synchronous session initialization (blocks for up to 30s)."""
+        try:
+            session_info = detect_session()
+        except NoActiveSession:
+            self.session_ready = False
+            self._log("No active session yet — throttle disabled until session starts.")
+            return
+
+        self._apply_session_info(session_info)
+
+    async def _init_session_async(self) -> None:
+        """Async session initialization (non-blocking)."""
+        try:
+            session_info = await detect_session_async()
+        except NoActiveSession:
+            self.session_ready = False
+            self._log("No active session yet — throttle disabled until session starts.")
+            return
+
+        self._apply_session_info(session_info)
+
     def reinit(self) -> None:
-        """Re-detect session info (e.g. after session reset)."""
+        """Re-detect session info synchronously (blocks for up to 30s).
+
+        WARNING: This function blocks the calling thread for up to 30 seconds.
+        Prefer reinit_async() in async contexts.
+        """
         self._log("Re-detecting session...")
         self.cumulative_cost = 0.0
         self.cumulative_tokens = 0
         self._init_session()
+
+    async def reinit_async(self) -> None:
+        """Re-detect session info asynchronously (non-blocking)."""
+        self._log("Re-detecting session...")
+        self.cumulative_cost = 0.0
+        self.cumulative_tokens = 0
+        await self._init_session_async()
 
     def add_usage(self, cost_usd: float, tokens: int, model: str | None = None) -> None:
         self.cumulative_cost += cost_usd

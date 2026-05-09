@@ -162,7 +162,7 @@ async def run_discovery_loop(
                 from datetime import datetime
                 if datetime.now() > throttle.session_end:
                     display.log("Session expired, re-detecting...")
-                    throttle.reinit()
+                    await throttle.reinit_async()
 
             if throttle_enabled and throttle:
                 await throttle.wait_if_needed()
@@ -213,7 +213,7 @@ async def run_discovery_loop(
                     session_id = None
                     session_start_time = _dt.now()
                     if throttle:
-                        throttle.reinit()
+                        await throttle.reinit_async()
                     consecutive_errors = 0
                     iteration -= 1
                     continue
@@ -238,7 +238,7 @@ async def run_discovery_loop(
                         session_id = None
                         session_start_time = _dt.now()
                         if throttle:
-                            throttle.reinit()
+                            await throttle.reinit_async()
                         consecutive_errors = 0
                         iteration -= 1
                         continue
@@ -349,7 +349,7 @@ async def run_discovery_loop(
                                 session_id = None
                                 session_start_time = _dt.now()
                                 if throttle:
-                                    throttle.reinit()
+                                    await throttle.reinit_async()
                                 break
                             display.on_error(f"Unexpected error during revision: {err_msg[:200]}")
                             # Save original plan as pending so it's not lost
