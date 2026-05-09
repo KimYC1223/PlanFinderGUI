@@ -1276,7 +1276,15 @@ class ReportBrowser(QWidget):
 
         if cats == {"pending"}:
             self._resolve_btn.setVisible(True)
+            self._resolve_btn.setEnabled(not self._is_running)
+            self._resolve_btn.setToolTip(
+                "Cannot resolve while another session is running" if self._is_running else ""
+            )
             self._reject_btn_a.setVisible(True)
+            self._reject_btn_a.setEnabled(not self._is_running)
+            self._reject_btn_a.setToolTip(
+                "Cannot reject while another session is running" if self._is_running else ""
+            )
             self._share_btn.setVisible(True)
         elif cats == {"working"}:
             self._restart_btn.setVisible(True)
