@@ -329,6 +329,21 @@ async def run_discovery_loop(
                             err_msg = str(e)
                             if _is_rate_limit_error(err_msg) or _is_retriable_error(err_msg):
                                 display.on_error(f"Error during revision: {err_msg[:120]}")
+                                # Save original plan as pending so it's not lost
+                                try:
+                                    state_mgr.add_pending(current_plan)
+                                    filepath = save_plan(
+                                        current_plan, iteration, report_dir, pending=True
+                                    )
+                                    session_pending += 1
+                                    display.log(
+                                        "Original plan saved as pending due to revision error."
+                                    )
+                                    display.on_plan_pending(current_plan, filepath)
+                                except Exception as save_err:
+                                    display.on_error(
+                                        f"Failed to save original plan: {save_err}"
+                                    )
                                 display.log("Waiting for next session...")
                                 await _wait_for_next_session(display, throttle)
                                 session_id = None
@@ -337,6 +352,21 @@ async def run_discovery_loop(
                                     throttle.reinit()
                                 break
                             display.on_error(f"Unexpected error during revision: {err_msg[:200]}")
+                            # Save original plan as pending so it's not lost
+                            try:
+                                state_mgr.add_pending(current_plan)
+                                filepath = save_plan(
+                                    current_plan, iteration, report_dir, pending=True
+                                )
+                                session_pending += 1
+                                display.log(
+                                    "Original plan saved as pending due to revision error."
+                                )
+                                display.on_plan_pending(current_plan, filepath)
+                            except Exception as save_err:
+                                display.on_error(
+                                    f"Failed to save original plan: {save_err}"
+                                )
                             break
 
                         if revision.session_id:
@@ -354,6 +384,21 @@ async def run_discovery_loop(
                             # loop back → request_approval called again with revised plan
                         else:
                             display.on_error("Revision failed to produce a plan.")
+                            # Save original plan as pending so it's not lost
+                            try:
+                                state_mgr.add_pending(current_plan)
+                                filepath = save_plan(
+                                    current_plan, iteration, report_dir, pending=True
+                                )
+                                session_pending += 1
+                                display.log(
+                                    "Original plan saved as pending due to revision failure."
+                                )
+                                display.on_plan_pending(current_plan, filepath)
+                            except Exception as save_err:
+                                display.on_error(
+                                    f"Failed to save original plan: {save_err}"
+                                )
                             break
 
     except (KeyboardInterrupt, asyncio.CancelledError):
