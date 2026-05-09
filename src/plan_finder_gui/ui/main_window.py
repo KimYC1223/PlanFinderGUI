@@ -1045,56 +1045,129 @@ class MainWindow(QMainWindow):
     #  Report browser action handlers                                      #
     # ------------------------------------------------------------------ #
 
+    def _rollback_moves(
+        self,
+        completed_moves: list[tuple[Path, Path]],
+    ) -> tuple[int, list[str]]:
+        """
+        Roll back completed file moves in reverse order.
+
+        Args:
+            completed_moves: List of (source, dest) tuples representing moves
+                that have been completed and need to be reversed.
+
+        Returns:
+            A tuple of (success_count, failed_filenames) indicating how many
+            rollbacks succeeded and which files failed to roll back.
+        """
+        success_count = 0
+        failed: list[str] = []
+
+        # Reverse order to handle dependencies (e.g., translation after main)
+        for src, dest in reversed(completed_moves):
+            try:
+                if dest.exists():
+                    dest.rename(src)
+                    success_count += 1
+                elif src.exists():
+                    # Already at original location, consider it rolled back
+                    success_count += 1
+                else:
+                    # File is missing from both locations
+                    failed.append(dest.name)
+            except OSError as e:
+                self.log_panel.append_log(
+                    f"Rollback failed: {dest.name} → {src.name} ({e})", "warn"
+                )
+                failed.append(dest.name)
+
+        return success_count, failed
+
     def _on_resolve_requested(self, paths: list) -> None:
-        """Move pending files to working/, then start a resolve session."""
+        """Move pending files to working/, then start a resolve session.
+
+        This method uses transactional file moves: if any move fails or if
+        the session fails to start, all successfully moved files are rolled
+        back to their original locations.
+        """
         from ..engine.executor import _show_error
 
         config = self.config_panel.get_config()
         if not self._ensure_project_access(config["project_dir"]):
             return
 
+        report_dir = self._get_report_dir()
+        working_dir = report_dir / "working"
+
+        # Phase 1: Prepare all moves without executing them
+        # Each entry is (source_path, dest_path)
+        pending_moves: list[tuple[Path, Path]] = []
+        for p in paths:
+            orig = Path(p)
+            if orig.exists():
+                dest = working_dir / orig.name
+                pending_moves.append((orig, dest))
+                # Also prepare translated file move
+                trans = _find_translated_helper(orig)
+                if trans and trans.exists():
+                    pending_moves.append((trans, working_dir / trans.name))
+
+        if not pending_moves:
+            return
+
+        # Phase 2: Execute moves transactionally with rollback on failure
+        completed_moves: list[tuple[Path, Path]] = []
+        moved_destinations: list[Path] = []  # Only main files, not translations
+
         try:
-            report_dir = self._get_report_dir()
-            working_dir = report_dir / "working"
             working_dir.mkdir(parents=True, exist_ok=True)
 
-            moved: list[Path] = []
-            for p in paths:
-                orig = Path(p)
-                if orig.exists():
-                    dest = working_dir / orig.name
-                    orig.rename(dest)
-                    moved.append(dest)
-                    # Also move any translated versions
-                    trans = _find_translated_helper(orig)
-                    if trans and trans.exists():
-                        trans.rename(working_dir / trans.name)
+            for src, dest in pending_moves:
+                src.rename(dest)
+                completed_moves.append((src, dest))
+                # Track main files (not translations) for session
+                if not _is_translated_md(dest):
+                    moved_destinations.append(dest)
+
         except Exception as e:
-            _show_error(
-                "pending → working 이동 실패",
-                "파일을 working/ 으로 이동하는 도중 오류가 발생했습니다.",
-                e,
-            )
+            # Rollback all completed moves
+            success_count, failed_files = self._rollback_moves(completed_moves)
+
+            if failed_files:
+                rollback_msg = (
+                    f"파일을 working/ 으로 이동하는 도중 오류가 발생했습니다.\n"
+                    f"롤백 부분 실패: {len(failed_files)}개 파일이 working/ 에 남아있습니다.\n"
+                    f"다음 시작 시 자동 복구됩니다: {', '.join(failed_files)}"
+                )
+            else:
+                rollback_msg = (
+                    f"파일을 working/ 으로 이동하는 도중 오류가 발생했습니다.\n"
+                    f"모든 파일이 원래 위치로 롤백되었습니다."
+                )
+
+            _show_error("pending → working 이동 실패", rollback_msg, e)
+            self.report_browser.refresh()
             return
 
         self.report_browser.refresh()
 
-        if not moved:
+        if not moved_destinations:
             return
 
+        # Phase 3: Start session, rollback if it fails
         try:
             adapter = GuiDisplayAdapter(self)
 
             from ..engine.executor import run_resolve_session
 
             label = (
-                f"Resolve · 일괄 {len(moved)}개"
-                if len(moved) > 1
-                else f"Resolve · {moved[0].name}"
+                f"Resolve · 일괄 {len(moved_destinations)}개"
+                if len(moved_destinations) > 1
+                else f"Resolve · {moved_destinations[0].name}"
             )
 
             coro = run_resolve_session(
-                plan_paths=moved,
+                plan_paths=moved_destinations,
                 display=adapter,
                 cwd=config["project_dir"],
                 model=config["model"] or None,
@@ -1107,11 +1180,23 @@ class MainWindow(QMainWindow):
                 is_resolve=True,
             )
         except Exception as e:
-            _show_error(
-                "Resolve 세션 시작 실패",
-                "resolve 세션을 시작하는 도중 오류가 발생했습니다.",
-                e,
-            )
+            # Session failed to start - rollback all moved files
+            success_count, failed_files = self._rollback_moves(completed_moves)
+
+            if failed_files:
+                rollback_msg = (
+                    f"resolve 세션을 시작하는 도중 오류가 발생했습니다.\n"
+                    f"롤백 부분 실패: {len(failed_files)}개 파일이 working/ 에 남아있습니다.\n"
+                    f"다음 시작 시 자동 복구됩니다: {', '.join(failed_files)}"
+                )
+            else:
+                rollback_msg = (
+                    f"resolve 세션을 시작하는 도중 오류가 발생했습니다.\n"
+                    f"모든 파일이 pending/ 으로 롤백되었습니다."
+                )
+
+            _show_error("Resolve 세션 시작 실패", rollback_msg, e)
+            self.report_browser.refresh()
 
     def _on_reject_requested(self, paths: list) -> None:
         """Move pending files to reject/."""
