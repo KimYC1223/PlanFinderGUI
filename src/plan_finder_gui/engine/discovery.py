@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,9 +13,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
     query,
 )
+from pydantic import ValidationError
 
 from .models import DiscoveredPlan
 from .tool_summary import summarize_tool
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,7 +145,17 @@ async def discover_plan(
                         + u.get("cache_creation_input_tokens", 0)
                     )
                 if message.subtype == "success" and message.structured_output:
-                    plan = DiscoveredPlan.model_validate(message.structured_output)
+                    try:
+                        plan = DiscoveredPlan.model_validate(message.structured_output)
+                    except ValidationError as ve:
+                        # Log validation error but preserve cost data for tracking
+                        logger.warning(
+                            "ValidationError parsing structured output: %s. "
+                            "Cost will still be tracked. Raw output: %s",
+                            ve,
+                            message.structured_output,
+                        )
+                        plan = None
 
         return DiscoveryResult(
             plan=plan, cost_usd=cost, total_tokens=tokens, session_id=session_id,

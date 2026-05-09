@@ -394,3 +394,152 @@ class TestRevisionFailurePreservesPlan:
 
         # Verify error about save failure was logged
         assert any("Failed to save original plan" in err for err in mock_display.errors)
+
+
+class TestValidationErrorPreservesCost:
+    """Tests that verify cost data is preserved when ValidationError occurs."""
+
+    @pytest.fixture
+    def temp_report_dir(self, tmp_path: Path) -> Path:
+        """Create a temporary report directory."""
+        report_dir = tmp_path / "reports"
+        report_dir.mkdir()
+        return report_dir
+
+    @pytest.fixture
+    def mock_display(self) -> MockDisplayInterface:
+        """Create a mock display interface."""
+        display = MockDisplayInterface()
+        display.costs: list[tuple[float, int, int]] = []
+        original_on_iteration_cost = display.on_iteration_cost
+
+        def track_cost(cost: float, tokens: int, turns: int) -> None:
+            display.costs.append((cost, tokens, turns))
+            original_on_iteration_cost(cost, tokens, turns)
+
+        display.on_iteration_cost = track_cost
+        return display
+
+    def test_validation_error_in_structured_output_preserves_cost(
+        self, temp_report_dir: Path, mock_display: MockDisplayInterface
+    ):
+        """When model_validate fails, cost should still be tracked."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage
+
+        from plan_finder_gui.engine.discovery import discover_plan
+
+        # Create mock messages that simulate the SDK returning invalid data
+        mock_assistant_msg = MagicMock(spec=AssistantMessage)
+        mock_assistant_msg.model = "claude-3-opus"
+        mock_assistant_msg.content = []
+
+        mock_result_msg = MagicMock(spec=ResultMessage)
+        mock_result_msg.subtype = "success"
+        mock_result_msg.total_cost_usd = 0.05  # Cost incurred
+        mock_result_msg.session_id = "test-session-456"
+        mock_result_msg.usage = {
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 50,
+        }
+        # Invalid structured output: priority=0 is outside valid range [1,5]
+        mock_result_msg.structured_output = {
+            "title": "Test Plan",
+            "keyword": "TestKeyword",
+            "category": "feature",
+            "priority": 0,  # Invalid: must be 1-5
+            "estimated_effort": "small",
+            "description": "Test description",
+            "rationale": "Test rationale",
+            "files_affected": ["test.py"],
+            "implementation_steps": ["Step 1"],
+            "risks": [],
+            "found_nothing": False,
+        }
+
+        async def mock_query(*args, **kwargs):
+            yield mock_assistant_msg
+            yield mock_result_msg
+
+        async def run_test():
+            with patch(
+                "plan_finder_gui.engine.discovery.query",
+                side_effect=mock_query,
+            ), patch(
+                "plan_finder_gui.engine.executor._resolve_cli_path",
+                return_value=None,
+            ), patch(
+                "plan_finder_gui.engine.executor._resolve_anthropic_api_key",
+                return_value=None,
+            ):
+                result = await discover_plan(
+                    prompt="Find improvements",
+                    cwd=str(temp_report_dir),
+                )
+
+                # Verify plan is None due to ValidationError
+                assert result.plan is None
+
+                # Verify cost data is still preserved
+                assert result.cost_usd == 0.05
+                assert result.total_tokens == 850  # 500 + 200 + 100 + 50
+                assert result.session_id == "test-session-456"
+
+        asyncio.run(run_test())
+
+    def test_validation_error_cost_tracked_in_discovery_loop(
+        self, temp_report_dir: Path, mock_display: MockDisplayInterface
+    ):
+        """When ValidationError occurs, cost should still be tracked in the discovery loop."""
+        # First call: return result with plan=None (simulating ValidationError)
+        # Second call: return valid found_nothing plan to end loop
+        discover_call_count = [0]
+
+        found_nothing_plan = make_mock_plan("Nothing Found")
+        found_nothing_plan.found_nothing = True
+
+        async def mock_discover(*args, **kwargs):
+            discover_call_count[0] += 1
+            if discover_call_count[0] == 1:
+                # Simulates result after ValidationError - plan is None but cost is tracked
+                return DiscoveryResult(
+                    plan=None,
+                    session_id="test-session",
+                    cost_usd=0.03,  # Cost was incurred
+                    total_tokens=300,
+                    num_turns=2,
+                    model="claude-3-opus",
+                )
+            else:
+                # Return found_nothing to end the loop
+                return make_discovery_result(found_nothing_plan)
+
+        async def run_test():
+            with patch(
+                "plan_finder_gui.engine.engine.discover_plan",
+                side_effect=mock_discover,
+            ), patch(
+                "plan_finder_gui.engine.engine._wait_if_quiet_hours",
+                new_callable=AsyncMock,
+            ):
+                await run_discovery_loop(
+                    plan_prompt="Find improvements",
+                    display=mock_display,
+                    max_iterations=5,
+                    report_dir=temp_report_dir,
+                    auto=True,
+                )
+
+        asyncio.run(run_test())
+
+        # Verify cost was tracked for both iterations
+        assert len(mock_display.costs) == 2
+
+        # First iteration had the ValidationError result - cost should still be tracked
+        assert mock_display.costs[0] == (0.03, 300, 2)
+
+        # Verify "Failed to get structured output" was logged (retry behavior)
+        assert any(
+            "Failed to get structured output" in log for log in mock_display.logs
+        )
