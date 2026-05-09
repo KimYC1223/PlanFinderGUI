@@ -595,23 +595,29 @@ class MainWindow(QMainWindow):
                 from ..ui.google_auth_dialog import GoogleAuthDialog
                 if not GoogleAuthDialog.ensure_credentials(self):
                     return  # user cancelled
-                from ..engine.translator import save_translated, translate_with_google
+                from ..engine.translator import (
+                    save_translated_async,
+                    translate_with_google_async,
+                )
 
-                def post_save_hook(filepath: Path) -> None:
+                async def post_save_hook(filepath: Path) -> None:
                     try:
                         content = filepath.read_text(encoding="utf-8")
-                        translated = translate_with_google(content)
-                        save_translated(filepath, translated)
+                        translated = await translate_with_google_async(content)
+                        await save_translated_async(filepath, translated)
                     except Exception as e:
                         self.log_panel.append_log(f"Translation failed: {e}", "warn")
             else:
-                from ..engine.translator import save_translated, translate_with_claude
+                from ..engine.translator import (
+                    save_translated_async,
+                    translate_with_claude_async,
+                )
 
-                def post_save_hook(filepath: Path) -> None:
+                async def post_save_hook(filepath: Path) -> None:
                     try:
                         content = filepath.read_text(encoding="utf-8")
-                        translated = translate_with_claude(content)
-                        save_translated(filepath, translated)
+                        translated = await translate_with_claude_async(content)
+                        await save_translated_async(filepath, translated)
                     except Exception as e:
                         self.log_panel.append_log(f"Translation failed: {e}", "warn")
 

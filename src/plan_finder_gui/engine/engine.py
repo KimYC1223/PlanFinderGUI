@@ -107,7 +107,7 @@ async def run_discovery_loop(
     stop_at: object | None = None,  # datetime.time
     model: str | None = None,
     max_turns: int = 80,
-    post_save_hook=None,  # Callable[[Path], None] | None
+    post_save_hook=None,  # Callable[[Path], Awaitable[None]] | Callable[[Path], None] | None
 ) -> None:
     """Main discovery loop.
 
@@ -278,7 +278,10 @@ async def run_discovery_loop(
                 filepath = save_plan(result.plan, iteration, report_dir, pending=True)
                 if post_save_hook:
                     try:
-                        post_save_hook(filepath)
+                        if asyncio.iscoroutinefunction(post_save_hook):
+                            await post_save_hook(filepath)
+                        else:
+                            post_save_hook(filepath)
                     except Exception:
                         pass
                 session_pending += 1

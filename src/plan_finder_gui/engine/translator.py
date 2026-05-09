@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -18,6 +19,20 @@ def _anthropic_client():
     if key:
         return anthropic.Anthropic(api_key=key)
     return anthropic.Anthropic()
+
+
+def _async_anthropic_client():
+    """Build an async Anthropic SDK client using the user's API key when present."""
+    import anthropic
+
+    try:
+        from .executor import _resolve_anthropic_api_key
+        key = _resolve_anthropic_api_key()
+    except Exception:
+        key = None
+    if key:
+        return anthropic.AsyncAnthropic(api_key=key)
+    return anthropic.AsyncAnthropic()
 
 # ---------------------------------------------------------------------------
 # Code-block masking helpers
@@ -129,6 +144,66 @@ def translate_with_claude(text: str, target_lang: str = "ko") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Async translation functions (non-blocking for event loop)
+# ---------------------------------------------------------------------------
+
+
+async def translate_with_google_async(text: str, target_lang: str = "ko") -> str:
+    """Translate text using Google Cloud Translate v2 (async/non-blocking).
+
+    Runs the synchronous Google Cloud client in a thread pool to avoid
+    blocking the asyncio event loop.
+
+    Requires GOOGLE_APPLICATION_CREDENTIALS environment variable to be set.
+    The google-cloud-translate package must be installed.
+    """
+    return await asyncio.to_thread(translate_with_google, text, target_lang)
+
+
+async def translate_with_claude_async(text: str, target_lang: str = "ko") -> str:
+    """Translate text using the Anthropic Claude API (Haiku model, async).
+
+    Uses the async Anthropic client to avoid blocking the asyncio event loop.
+    Keeps markdown formatting, code blocks, and file paths unchanged.
+    """
+    masked, blocks = _mask_code(text)
+
+    client = _async_anthropic_client()
+
+    lang_names = {
+        "ko": "Korean",
+        "ja": "Japanese",
+        "zh": "Chinese (Simplified)",
+        "fr": "French",
+        "de": "German",
+        "es": "Spanish",
+        "pt": "Portuguese",
+        "ru": "Russian",
+    }
+    lang_name = lang_names.get(target_lang, target_lang)
+
+    system_prompt = (
+        f"You are a professional technical translator. "
+        f"Translate the following markdown document to {lang_name}. "
+        f"Rules:\n"
+        f"- Keep ALL markdown formatting intact (headings, bullet points, bold, italic, etc.)\n"
+        f"- Placeholders like {{{{0}}}}, {{{{1}}}}, etc. represent code blocks — output them EXACTLY as-is, do NOT translate or modify them.\n"
+        f"- Keep ALL file paths unchanged (e.g. src/foo/bar.py)\n"
+        f"- Only output the translated text, nothing else"
+    )
+
+    message = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=8192,
+        system=system_prompt,
+        messages=[{"role": "user", "content": masked}],
+    )
+
+    translated: str = message.content[0].text
+    return _unmask_code(translated, blocks)
+
+
+# ---------------------------------------------------------------------------
 # File saving
 # ---------------------------------------------------------------------------
 
@@ -152,3 +227,19 @@ def save_translated(
     translated_path = translated_dir / translated_name
     atomic_write(translated_path, translated_text)
     return translated_path
+
+
+async def save_translated_async(
+    original_path: Path,
+    translated_text: str,
+    target_lang: str = "ko",
+) -> Path:
+    """Save translated text to a translated/ subdirectory (async/non-blocking).
+
+    Runs the synchronous file write in a thread pool to avoid blocking
+    the asyncio event loop.
+
+    For example, given ``/reports/pending/plan.md`` and ``target_lang="ko"``,
+    saves to ``/reports/pending/translated/plan.ko.md`` and returns that path.
+    """
+    return await asyncio.to_thread(save_translated, original_path, translated_text, target_lang)
