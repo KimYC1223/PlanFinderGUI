@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
@@ -21,10 +21,34 @@ from PySide6.QtWidgets import (
 # ---------------------------------------------------------------------------
 
 class _Worker(QObject):
+    """Background worker that runs ccusage in a thread and emits parsed data.
+
+    Uses a stop event to prevent emitting signals on a destroyed QObject
+    when the panel is closed while a subprocess is still running.
+    """
+
     data_ready = Signal(dict)
 
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._stop_event = threading.Event()
+        self._current_thread: threading.Thread | None = None
+
     def fetch(self) -> None:
-        threading.Thread(target=self._run, daemon=True).start()
+        """Start fetching ccusage data in a background thread."""
+        self._current_thread = threading.Thread(target=self._run, daemon=True)
+        self._current_thread.start()
+
+    def stop(self) -> None:
+        """Signal the worker to stop and wait briefly for the thread to finish.
+
+        Sets the stop event to prevent signal emission on destroyed objects.
+        Waits up to 0.5s for the thread to finish; if it doesn't, the daemon
+        thread will be orphaned (acceptable since it's just ccusage).
+        """
+        self._stop_event.set()
+        if self._current_thread is not None and self._current_thread.is_alive():
+            self._current_thread.join(timeout=0.5)
 
     def _run(self) -> None:
         result: dict = {"session": None, "today_cost": 0.0, "today_tokens": 0, "account": None, "error": None}
@@ -63,6 +87,10 @@ class _Worker(QObject):
 
         # ── Account info ────────────────────────────────────────────────────
         result["account"] = _read_account_email()
+
+        # Check if we should stop before emitting (panel may have been destroyed)
+        if self._stop_event.is_set():
+            return
 
         self.data_ready.emit(result)
 
@@ -109,7 +137,7 @@ class ClaudeSessionPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._worker = _Worker()
+        self._worker = _Worker(self)  # Parent to self for Qt lifecycle management
         self._worker.data_ready.connect(self._on_data)
         self._fetching = False
 
@@ -121,6 +149,29 @@ class ClaudeSessionPanel(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
         self._refresh()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Clean up the worker thread when the panel is closed."""
+        self._cleanup()
+        super().closeEvent(event)
+
+    def event(self, event: QEvent) -> bool:  # type: ignore[override]
+        """Handle destruction events to ensure cleanup is called.
+
+        This catches cases where the widget is destroyed without closeEvent
+        being called (e.g., when it's a child widget and the parent is destroyed).
+        """
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._cleanup()
+        return super().event(event)
+
+    def _cleanup(self) -> None:
+        """Stop the timer and worker to prevent signal emission on destroyed objects.
+
+        This method is idempotent and safe to call multiple times.
+        """
+        self._timer.stop()
+        self._worker.stop()
 
     # ------------------------------------------------------------------ #
 
