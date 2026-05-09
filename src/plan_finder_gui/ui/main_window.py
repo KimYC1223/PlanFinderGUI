@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..engine.engine import run_discovery_loop
 from ..engine.session_manager import Session, SessionManager
+from ..engine.state import StateManager
 from ..engine.throttle import CcusageNotInstalled, NoActiveSession, SessionThrottle
 from .claude_session_panel import ClaudeSessionPanel
 from .config_panel import ConfigPanel
@@ -531,6 +532,54 @@ class MainWindow(QMainWindow):
         sound_player.play("buzz.wav")
         QMessageBox.warning(self, title, msg)
 
+    def _show_state_corruption_warning(self, backup_path: Path | None) -> None:
+        """Show a warning dialog when state file corruption was detected."""
+        sound_player.play("buzz.wav")
+
+        msg = (
+            "The state file (.state.json) was corrupted and could not be loaded.\n\n"
+            "A fresh state has been initialized, which means all rejection history "
+            "has been reset. Claude may re-propose plans that were previously rejected.\n"
+        )
+        if backup_path:
+            msg += f"\nA backup of the corrupted file was saved to:\n{backup_path}"
+
+        mb = QMessageBox(self)
+        mb.setWindowTitle("State File Corrupted")
+        mb.setIcon(QMessageBox.Icon.Warning)
+        mb.setText("State file was corrupted")
+        mb.setInformativeText(msg)
+        mb.setStyleSheet(
+            "QMessageBox { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; }"
+            "QPushButton {"
+            "  background: #333; color: #ccc; border: 1px solid #444;"
+            "  border-radius: 4px; padding: 5px 14px; min-width: 80px;"
+            "}"
+            "QPushButton:hover { background: #3d3d3d; }"
+            "QPushButton:default { background: #0e78d5; color: white; border: none; }"
+            "QPushButton:default:hover { background: #1e88e5; }"
+        )
+
+        if backup_path:
+            open_btn = mb.addButton("Open Backup Location", QMessageBox.ButtonRole.ActionRole)
+        ok_btn = mb.addButton(QMessageBox.StandardButton.Ok)
+        mb.setDefaultButton(ok_btn)
+
+        mb.exec()
+
+        if backup_path and mb.clickedButton() == open_btn:
+            import subprocess
+            import sys
+            # Open the folder containing the backup file
+            folder = backup_path.parent
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(folder)], check=False)
+            elif sys.platform == "win32":
+                subprocess.run(["explorer", str(folder)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(folder)], check=False)
+
     def _ensure_project_access(self, project_dir: str) -> bool:
         """Validate project dir + pre-trigger macOS folder-access prompt.
 
@@ -586,6 +635,13 @@ class MainWindow(QMainWindow):
             if config["stop_at"] <= _dt.now():
                 self._warn("잘못된 중단 시간", "중단 시간이 현재보다 과거입니다.")
                 return
+
+        # Check for state file corruption before starting session
+        report_dir = self._get_report_dir()
+        state_mgr = StateManager(report_dir)
+        state_mgr.load()
+        if state_mgr.load_error:
+            self._show_state_corruption_warning(state_mgr.backup_path)
 
         # Handle translation credentials check before starting
         post_save_hook = None

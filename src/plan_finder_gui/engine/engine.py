@@ -128,6 +128,12 @@ async def run_discovery_loop(
     state_mgr = StateManager(report_dir)
     state_mgr.load()
 
+    if state_mgr.load_error:
+        backup_info = f" Backup created at {state_mgr.backup_path}" if state_mgr.backup_path else ""
+        display.on_error(
+            f"State file was corrupted.{backup_info} Rejection history has been reset."
+        )
+
     from datetime import datetime as _dt
 
     iteration = 0

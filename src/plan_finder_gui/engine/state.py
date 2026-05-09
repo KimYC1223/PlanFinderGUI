@@ -15,6 +15,7 @@ class StateManager:
         self.path = report_dir / ".state.json"
         self._state: PlanFinderState | None = None
         self.load_error: bool = False
+        self.backup_path: Path | None = None
 
     def load(self) -> PlanFinderState:
         if self.path.exists():
@@ -27,6 +28,7 @@ class StateManager:
                     f".json.corrupted.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 )
                 shutil.copy2(self.path, backup)
+                self.backup_path = backup
                 self._state = PlanFinderState()
                 self.load_error = True
         else:
