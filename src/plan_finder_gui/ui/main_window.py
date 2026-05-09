@@ -35,13 +35,29 @@ from . import sound_player
 
 
 def _find_translated_helper(original: Path) -> Path | None:
-    """Find a sibling translated file like original_stem.XX.md."""
+    """Find translated version of a file.
+
+    Checks two locations:
+    1. Same directory as original: stem.XX.md
+    2. translated/ subdirectory: translated/stem.XX.md
+    """
     parent = original.parent
     stem = original.stem
+
+    # Same-directory sibling
     for f in parent.glob(f"{stem}.*.md"):
         parts = f.stem.rsplit(".", 1)
         if len(parts) == 2 and len(parts[1]) == 2:
             return f
+
+    # translated/ subdirectory
+    trans_dir = parent / "translated"
+    if trans_dir.is_dir():
+        for f in trans_dir.glob(f"{stem}.*.md"):
+            parts = f.stem.rsplit(".", 1)
+            if len(parts) == 2 and len(parts[1]) == 2:
+                return f
+
     return None
 
 
@@ -1290,11 +1306,30 @@ class MainWindow(QMainWindow):
 
         for p in paths:
             orig = Path(p)
-            if orig.exists():
+            if not orig.exists():
+                continue
+
+            # Find translation before moving main file (uses orig.parent for lookup)
+            trans = _find_translated_helper(orig)
+
+            try:
                 orig.rename(reject_dir / orig.name)
-                trans = _find_translated_helper(orig)
-                if trans and trans.exists():
-                    trans.rename(reject_dir / trans.name)
+            except OSError as e:
+                self.log_panel.append_log(
+                    f"Failed to reject {orig.name}: {e}", "warn"
+                )
+                continue
+
+            # Move translation to reject/translated/ subdirectory
+            if trans and trans.exists():
+                try:
+                    reject_trans_dir = reject_dir / "translated"
+                    reject_trans_dir.mkdir(parents=True, exist_ok=True)
+                    trans.rename(reject_trans_dir / trans.name)
+                except OSError as e:
+                    self.log_panel.append_log(
+                        f"Failed to move translation {trans.name}: {e}", "warn"
+                    )
 
         self.report_browser.refresh()
 
@@ -1347,10 +1382,29 @@ class MainWindow(QMainWindow):
 
         for p in paths:
             orig = Path(p)
-            if orig.exists():
+            if not orig.exists():
+                continue
+
+            # Find translation before moving main file (uses orig.parent for lookup)
+            trans = _find_translated_helper(orig)
+
+            try:
                 orig.rename(pending_dir / orig.name)
-                trans = _find_translated_helper(orig)
-                if trans and trans.exists():
-                    trans.rename(pending_dir / trans.name)
+            except OSError as e:
+                self.log_panel.append_log(
+                    f"Failed to restore {orig.name}: {e}", "warn"
+                )
+                continue
+
+            # Move translation to pending/translated/ subdirectory
+            if trans and trans.exists():
+                try:
+                    pending_trans_dir = pending_dir / "translated"
+                    pending_trans_dir.mkdir(parents=True, exist_ok=True)
+                    trans.rename(pending_trans_dir / trans.name)
+                except OSError as e:
+                    self.log_panel.append_log(
+                        f"Failed to move translation {trans.name}: {e}", "warn"
+                    )
 
         self.report_browser.refresh()
