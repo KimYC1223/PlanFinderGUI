@@ -49,13 +49,28 @@ def scan_existing_plans(report_dir: Path) -> list[ExistingPlanSummary]:
     Does NOT open files — only globs filenames. Translated companions
     (`*.XX.md`) are skipped. Files that fail to parse are logged and skipped
     rather than causing a crash.
+
+    If a directory cannot be read due to filesystem errors (permission denied,
+    network timeout, I/O error), the directory is skipped with a warning and
+    scanning continues with the remaining directories.
     """
     out: list[ExistingPlanSummary] = []
     for status in EXISTING_PLAN_DIRS:
         cat_dir = report_dir / status
         if not cat_dir.is_dir():
             continue
-        for f in sorted(cat_dir.glob("*.md")):
+        try:
+            plan_files = sorted(cat_dir.glob("*.md"))
+        except OSError as e:
+            # Directory scanning failed (permission denied, network timeout, etc.)
+            # Log warning and continue with remaining directories
+            logger.warning(
+                "Failed to scan directory %s for existing plans: %s",
+                cat_dir,
+                e,
+            )
+            continue
+        for f in plan_files:
             try:
                 if _is_translated_stem(f.stem):
                     continue
