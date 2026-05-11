@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
 
 import qasync
@@ -59,6 +60,10 @@ def main() -> None:
     window.setWindowTitle("Plan Finder")
     window.resize(1200, 800)
     window.show()
+
+    # SIGTERM (e.g. `kill`, Activity Monitor quit) → close the window normally
+    # so closeEvent runs and subprocesses are cleaned up.
+    signal.signal(signal.SIGTERM, lambda *_: window.close())
 
     from PySide6.QtCore import QSettings, QTimer
     from .ui import sound_player

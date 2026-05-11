@@ -21,7 +21,17 @@ _RATE_LIMIT_PATTERNS = [
     "overloaded",
 ]
 
+_FATAL_ERROR_PATTERNS = [
+    "billing_error",
+    "authentication_failed",
+]
+
 MAX_CONSECUTIVE_ERRORS = 3
+
+
+def _is_fatal_error(err_msg: str) -> bool:
+    lower = err_msg.lower()
+    return any(p in lower for p in _FATAL_ERROR_PATTERNS)
 
 
 def _is_rate_limit_error(err_msg: str) -> bool:
@@ -213,6 +223,9 @@ async def run_discovery_loop(
                 raise
             except Exception as e:
                 err_msg = str(e)
+                if _is_fatal_error(err_msg):
+                    display.on_error(f"치명적 오류로 중단합니다: {err_msg[:200]}")
+                    break
                 if _is_rate_limit_error(err_msg):
                     display.on_error("Rate limit reached. Waiting for next session...")
                     await _wait_for_next_session(display, throttle)
@@ -333,6 +346,9 @@ async def run_discovery_loop(
                             raise
                         except Exception as e:
                             err_msg = str(e)
+                            if _is_fatal_error(err_msg):
+                                display.on_error(f"치명적 오류로 중단합니다: {err_msg[:200]}")
+                                break
                             if _is_rate_limit_error(err_msg) or _is_retriable_error(err_msg):
                                 display.on_error(f"Error during revision: {err_msg[:120]}")
                                 # Save original plan as pending so it's not lost

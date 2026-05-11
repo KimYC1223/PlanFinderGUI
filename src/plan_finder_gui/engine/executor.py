@@ -606,3 +606,83 @@ async def _run_resolve_session_batched(
             )
         _show_error("Resolve 세션 오류", summary, e)
         display.on_error(f"Error resolving batch: {e}")
+
+
+async def chat_with_plan(
+    original_path: Path,
+    message: str,
+    response_lang: str,
+) -> tuple[str, str | None]:
+    """Chat with Claude about a plan file.
+
+    Returns (response_text, proposed_new_content).
+    proposed_new_content is non-None when Claude modified the file during the
+    conversation. The original file is always restored before returning —
+    the caller decides whether to apply the proposed changes.
+    """
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        TextBlock,
+        ToolUseBlock,
+        query,
+    )
+
+    try:
+        original_content = original_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"파일 읽기 오류: {e}", None
+
+    lang_note = (
+        "Respond in English."
+        if response_lang == "en"
+        else "한국어로 답변하세요."
+    )
+    system_prompt = (
+        f"You are a helpful assistant reviewing a software improvement plan.\n"
+        f"{lang_note}\n"
+        f"The plan file path is: {original_path}\n"
+        f"You may use Edit or Write tools ONLY on that exact file path to propose "
+        f"changes. Do NOT access or modify any other files."
+    )
+    options = ClaudeAgentOptions(
+        allowed_tools=["Edit", "Write"],
+        permission_mode="bypassPermissions",
+        cwd=str(original_path.parent),
+        max_turns=10,
+        system_prompt=system_prompt,
+    )
+    cli_path = _resolve_cli_path()
+    if cli_path:
+        options.cli_path = cli_path
+    api_key = _resolve_anthropic_api_key()
+    if api_key:
+        options.env = {**(options.env or {}), "ANTHROPIC_API_KEY": api_key}
+
+    prompt = (
+        f"Plan file content:\n\n```markdown\n{original_content}\n```\n\n"
+        f"User message: {message}"
+    )
+
+    response_parts: list[str] = []
+    file_was_written = False
+
+    async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    response_parts.append(block.text)
+                elif isinstance(block, ToolUseBlock) and block.name in ("Edit", "Write"):
+                    file_was_written = True
+
+    response_text = "".join(response_parts).strip() or "(응답 없음)"
+
+    proposed_content: str | None = None
+    if file_was_written and original_path.exists():
+        try:
+            proposed_content = original_path.read_text(encoding="utf-8")
+            original_path.write_text(original_content, encoding="utf-8")
+        except Exception:
+            proposed_content = None
+
+    return response_text, proposed_content

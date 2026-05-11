@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import platform
 import re
 import shutil
@@ -8,18 +9,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QSettings, Qt, QTimer, QUrl, Signal
 from . import sound_player
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -274,6 +278,7 @@ class ReportBrowser(QWidget):
 
     resolve_requested = Signal(list)   # list[Path]
     reject_requested  = Signal(list)   # list[Path]
+    share_requested   = Signal(list, str)  # list[Path], member_name
     restart_requested = Signal(list)   # list[Path]
     restore_requested = Signal(list)   # list[Path]
 
@@ -284,6 +289,22 @@ class ReportBrowser(QWidget):
         self._current_file: Path | None = None   # original path of displayed file
         self._viewing_original: bool = False     # True → showing original even when translation exists
         self._suppress_click_deselect: bool = False  # set when itemChanged just previewed; itemClicked must not undo it
+        self._chat_pending_content: str | None = None  # Claude's proposed file content
+        self._chat_in_progress: bool = False
+        self._chat_task: asyncio.Task | None = None
+        # Per-file chat state: path → (history_html, pending_content)
+        self._chat_state: dict[Path, tuple[str, str | None]] = {}
+
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_fs_change)
+        self._fs_watcher.fileChanged.connect(self._on_fs_change)
+
+        # Debounce rapid bursts of change events (e.g. batch file moves).
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(300)
+        self._refresh_timer.timeout.connect(self.refresh)
+
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -354,10 +375,11 @@ class ReportBrowser(QWidget):
 
         self._resolve_btn  = _action_btn("✓  Resolve", "#2e7d32", "#388e3c")
         self._reject_btn_a = _action_btn("✗  Reject",  "#c62828", "#d32f2f")
+        self._share_btn    = _action_btn("⬆  Share",   "#e65100", "#f57c00")
         self._restart_btn  = _action_btn("↺  Restart", "#0d47a1", "#1565c0")
         self._restore_btn  = _action_btn("↩  Restore", "#4a4a4a", "#5a5a5a")
 
-        for btn in (self._resolve_btn, self._reject_btn_a, self._restart_btn, self._restore_btn):
+        for btn in (self._resolve_btn, self._reject_btn_a, self._share_btn, self._restart_btn, self._restore_btn):
             btn_layout.addWidget(btn)
             btn.setVisible(False)
 
@@ -367,6 +389,7 @@ class ReportBrowser(QWidget):
 
         self._resolve_btn.clicked.connect(self._on_resolve)
         self._reject_btn_a.clicked.connect(self._on_reject_action)
+        self._share_btn.clicked.connect(self._on_share)
         self._restart_btn.clicked.connect(self._on_restart)
         self._restore_btn.clicked.connect(self._on_restore)
 
@@ -396,18 +419,90 @@ class ReportBrowser(QWidget):
         self._viewer.customContextMenuRequested.connect(self._on_viewer_context_menu)
         right_layout.addWidget(self._viewer, stretch=1)
 
-        # Toggle view button bar (translated <-> original)
+        # Toggle view button bar (translated <-> original) + chat response language
         self._viewer_btn_bar = QWidget()
         self._viewer_btn_bar.setStyleSheet("background: #252526; border-top: 1px solid #333;")
         viewer_btn_layout = QHBoxLayout(self._viewer_btn_bar)
         viewer_btn_layout.setContentsMargins(8, 6, 8, 6)
         viewer_btn_layout.setSpacing(6)
         viewer_btn_layout.addStretch()
+        self._chat_lang_combo = QComboBox()
+        self._chat_lang_combo.addItem("한국어", "ko")
+        self._chat_lang_combo.addItem("English", "en")
+        self._chat_lang_combo.setFixedWidth(90)
+        self._chat_lang_combo.setFixedHeight(26)
+        self._chat_lang_combo.setStyleSheet(
+            "QComboBox { background: #3c3c3c; color: #ccc; border: 1px solid #555;"
+            " border-radius: 3px; padding: 2px 6px; font-size: 11px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView { background: #3c3c3c; color: #ccc;"
+            " selection-background-color: #094771; }"
+        )
+        viewer_btn_layout.addWidget(self._chat_lang_combo)
         self._toggle_view_btn = _action_btn("🌐  원문보기", "#00695c", "#00897b")
         self._toggle_view_btn.clicked.connect(self._on_toggle_view)
         viewer_btn_layout.addWidget(self._toggle_view_btn)
         self._viewer_btn_bar.setVisible(False)
         right_layout.addWidget(self._viewer_btn_bar)
+
+        # Chat panel (below viewer_btn_bar)
+        self._chat_panel = QWidget()
+        self._chat_panel.setStyleSheet("background: #1e1e1e; border-top: 1px solid #2a2a2a;")
+        chat_layout = QVBoxLayout(self._chat_panel)
+        chat_layout.setContentsMargins(8, 6, 8, 6)
+        chat_layout.setSpacing(4)
+
+        self._chat_history = QTextBrowser()
+        self._chat_history.setMaximumHeight(200)
+        self._chat_history.setMinimumHeight(80)
+        self._chat_history.setOpenExternalLinks(False)
+        self._chat_history.document().setMaximumBlockCount(100)
+        self._chat_history.setStyleSheet(
+            "QTextBrowser { background: #1a1a1a; border: 1px solid #2e2e2e;"
+            " border-radius: 4px; padding: 4px; font-size: 12px; color: #ccc; }"
+            "QScrollBar:vertical { width: 0px; }"
+        )
+        self._chat_history.setVisible(False)
+        chat_layout.addWidget(self._chat_history)
+
+        input_bar = QWidget()
+        input_layout = QHBoxLayout(input_bar)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(6)
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("Claude에게 질문하거나 피드백을 입력하세요…")
+        self._chat_input.setStyleSheet(
+            "QLineEdit { background: #2d2d2d; color: #ccc; border: 1px solid #555;"
+            " border-radius: 4px; padding: 4px 8px; font-size: 12px; }"
+            "QLineEdit:focus { border: 1px solid #0e639c; }"
+        )
+        self._chat_input.returnPressed.connect(self._on_send_chat)
+        self._chat_send_btn = _action_btn("전송", "#0e639c", "#1177bb")
+        self._chat_send_btn.setFixedWidth(52)
+        self._chat_send_btn.clicked.connect(self._on_send_chat)
+        input_layout.addWidget(self._chat_input)
+        input_layout.addWidget(self._chat_send_btn)
+        chat_layout.addWidget(input_bar)
+
+        self._chat_apply_bar = QWidget()
+        apply_layout = QHBoxLayout(self._chat_apply_bar)
+        apply_layout.setContentsMargins(0, 0, 0, 0)
+        apply_layout.setSpacing(6)
+        self._chat_auto_apply = QCheckBox("자동 적용")
+        self._chat_auto_apply.setStyleSheet(
+            "QCheckBox { color: #aaa; font-size: 11px; }"
+            "QCheckBox::indicator { width: 13px; height: 13px; }"
+        )
+        self._chat_apply_btn = _action_btn("📝 변경사항 적용", "#2e7d32", "#388e3c")
+        self._chat_apply_btn.clicked.connect(self._on_apply_chat_change)
+        apply_layout.addStretch()
+        apply_layout.addWidget(self._chat_auto_apply)
+        apply_layout.addWidget(self._chat_apply_btn)
+        self._chat_apply_bar.setVisible(False)
+        chat_layout.addWidget(self._chat_apply_bar)
+
+        self._chat_panel.setVisible(False)
+        right_layout.addWidget(self._chat_panel)
 
         self._right_widget.setVisible(False)
         splitter.addWidget(self._right_widget)
@@ -420,8 +515,33 @@ class ReportBrowser(QWidget):
 
     def set_report_dir(self, path: Path) -> None:
         self._report_dir = path
+        self._reset_watcher()
         self._deselect_file()
         self.refresh()
+
+    def _reset_watcher(self) -> None:
+        """Remove all previously watched paths and watch the current report dir tree."""
+        watched_dirs = self._fs_watcher.directories()
+        watched_files = self._fs_watcher.files()
+        if watched_dirs:
+            self._fs_watcher.removePaths(watched_dirs)
+        if watched_files:
+            self._fs_watcher.removePaths(watched_files)
+
+        if not self._report_dir or not self._report_dir.is_dir():
+            return
+
+        paths_to_watch: list[str] = [str(self._report_dir)]
+        for cat in _CATEGORIES:
+            cat_dir = self._report_dir / cat
+            if cat_dir.is_dir():
+                paths_to_watch.append(str(cat_dir))
+        self._fs_watcher.addPaths(paths_to_watch)
+
+    def _on_fs_change(self, _path: str) -> None:
+        # Re-arm the watcher for any category subdirs that might be newly created.
+        self._reset_watcher()
+        self._refresh_timer.start()
 
     def refresh(self) -> None:
         """Re-scan folder and rebuild tree, preserving expand/collapse state."""
@@ -482,6 +602,15 @@ class ReportBrowser(QWidget):
 
         self._tree.blockSignals(False)
         self._update_buttons()
+        self._purge_stale_chat_state()
+
+    def _purge_stale_chat_state(self) -> None:
+        """Remove _chat_state entries for files that no longer exist on disk."""
+        if not self._chat_state:
+            return
+        stale = [p for p in self._chat_state if not p.exists()]
+        for p in stale:
+            del self._chat_state[p]
 
     def set_running(self, running: bool) -> None:
         self._is_running = running
@@ -536,19 +665,23 @@ class ReportBrowser(QWidget):
         self._update_buttons()
 
     def _deselect_file(self) -> None:
+        self._save_chat_state()
         self._current_file = None
         self._viewing_original = False
         self._right_widget.setVisible(False)
+        self._unload_chat_ui()
 
     def _show_file(self, original: Path) -> None:
         was_hidden = not self._right_widget.isVisible()
-        # Reset to translated-by-default when navigating to a different file
         if original != self._current_file:
+            self._save_chat_state()
             self._viewing_original = False
+            self._restore_chat_state(original)
         self._current_file = original
         if was_hidden:
             self._right_widget.setVisible(True)
             self._splitter.setSizes([280, 720])
+        self._chat_panel.setVisible(True)
         translated = _find_translated(original)
         if translated and translated.exists() and not self._viewing_original:
             target = translated
@@ -572,15 +705,14 @@ class ReportBrowser(QWidget):
         self._update_toggle_button(translated)
 
     def _update_toggle_button(self, translated: Path | None) -> None:
-        """Show toggle button only when a translation exists; label depends on view mode."""
+        """Show button bar whenever a file is selected; toggle button only when translation exists."""
         has_translation = translated is not None and translated.exists()
-        self._viewer_btn_bar.setVisible(has_translation)
-        if not has_translation:
-            return
-        if self._viewing_original:
-            self._toggle_view_btn.setText("🌐  번역보기")
-        else:
-            self._toggle_view_btn.setText("🌐  원문보기")
+        self._viewer_btn_bar.setVisible(self._current_file is not None)
+        self._toggle_view_btn.setVisible(has_translation)
+        if has_translation:
+            self._toggle_view_btn.setText(
+                "🌐  번역보기" if self._viewing_original else "🌐  원문보기"
+            )
 
     def _on_toggle_view(self) -> None:
         if not self._current_file:
@@ -591,7 +723,11 @@ class ReportBrowser(QWidget):
     def _on_viewer_context_menu(self, pos: QPoint) -> None:
         if not self._current_file:
             return
-        self._show_file_context_menu(self._current_file, self._viewer.mapToGlobal(pos))
+        self._show_file_context_menu(
+            self._current_file,
+            self._viewer.mapToGlobal(pos),
+            category=self._get_file_category(self._current_file),
+        )
 
     def _on_tree_context_menu(self, pos: QPoint) -> None:
         item = self._tree.itemAt(pos)
@@ -603,8 +739,9 @@ class ReportBrowser(QWidget):
 
         if data[0] == "file":
             file_path = Path(data[1])
+            cat = data[2] if len(data) > 2 else ""
             self._show_file(file_path)
-            self._show_file_context_menu(file_path, self._tree.mapToGlobal(pos))
+            self._show_file_context_menu(file_path, self._tree.mapToGlobal(pos), category=cat)
         elif data[0] in ("folder", "keyword"):
             self._show_folder_context_menu(item, self._tree.mapToGlobal(pos))
 
@@ -689,14 +826,15 @@ class ReportBrowser(QWidget):
         elif distribute_act is not None and chosen == distribute_act:
             self._distribute_to_team(folder_item)
 
-    def _show_file_context_menu(self, path: Path, global_pos: QPoint) -> None:
-        menu = QMenu(self)
-        menu.setStyleSheet(
+    def _show_file_context_menu(self, path: Path, global_pos: QPoint, category: str = "") -> None:
+        _menu_style = (
             "QMenu { background: #2d2d2d; color: #ccc; border: 1px solid #444; }"
             "QMenu::item { padding: 6px 20px; }"
             "QMenu::item:selected { background: #094771; color: white; }"
             "QMenu::separator { height: 1px; background: #444; margin: 2px 8px; }"
         )
+        menu = QMenu(self)
+        menu.setStyleSheet(_menu_style)
 
         _is_mac = platform.system() == "Darwin"
         _is_win = platform.system() == "Windows"
@@ -714,6 +852,24 @@ class ReportBrowser(QWidget):
         if not _is_translated(path) and _find_translated(path) is None:
             menu.addSeparator()
             translate_act = menu.addAction("번역하기")
+
+        if category == "pending":
+            from PySide6.QtCore import QSettings
+            s = QSettings()
+            my_name = str(s.value("team/my_name", "") or "").strip()
+            members = [m for m in _read_team_members(s) if m != my_name]
+            menu.addSeparator()
+            share_menu = menu.addMenu("⬆  공유하기")
+            share_menu.setStyleSheet(_menu_style)
+            if members:
+                for member in members:
+                    act = share_menu.addAction(member)
+                    act.triggered.connect(
+                        lambda checked=False, m=member: self._do_share([path], m)
+                    )
+            else:
+                no_act = share_menu.addAction("(팀원 없음 — 설정에서 추가)")
+                no_act.setEnabled(False)
 
         chosen = menu.exec(global_pos)
 
@@ -1109,7 +1265,7 @@ class ReportBrowser(QWidget):
         checked = self._collect_checked()
         cats = set(checked.keys())
 
-        for btn in (self._resolve_btn, self._reject_btn_a, self._restart_btn, self._restore_btn):
+        for btn in (self._resolve_btn, self._reject_btn_a, self._share_btn, self._restart_btn, self._restore_btn):
             btn.setVisible(False)
 
         if not cats:
@@ -1121,6 +1277,7 @@ class ReportBrowser(QWidget):
         if cats == {"pending"}:
             self._resolve_btn.setVisible(True)
             self._reject_btn_a.setVisible(True)
+            self._share_btn.setVisible(True)
         elif cats == {"working"}:
             self._restart_btn.setVisible(True)
             self._restart_btn.setEnabled(not self._is_running)
@@ -1141,6 +1298,46 @@ class ReportBrowser(QWidget):
         if paths:
             self.reject_requested.emit(paths)
 
+    def _on_share(self) -> None:
+        paths = self._collect_checked().get("pending", [])
+        if not paths:
+            return
+        from PySide6.QtCore import QSettings
+        s = QSettings()
+        my_name = str(s.value("team/my_name", "") or "").strip()
+        members = [m for m in _read_team_members(s) if m != my_name]
+        if not members:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "팀원 없음",
+                "공유할 팀원이 없습니다.\n설정에서 팀원 목록을 추가해주세요.",
+            )
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #2d2d2d; color: #ccc; border: 1px solid #444; }"
+            "QMenu::item { padding: 6px 20px; }"
+            "QMenu::item:selected { background: #094771; color: white; }"
+        )
+        for member in members:
+            act = menu.addAction(member)
+            act.triggered.connect(
+                lambda checked=False, m=member, p=paths: self._do_share(p, m)
+            )
+        menu.exec(self._share_btn.mapToGlobal(self._share_btn.rect().bottomLeft()))
+
+    def _do_share(self, paths: list, member: str) -> None:
+        self.share_requested.emit(paths, member)
+
+    def _get_file_category(self, path: Path) -> str:
+        if self._report_dir is None:
+            return ""
+        try:
+            rel = path.relative_to(self._report_dir)
+            return rel.parts[0] if rel.parts else ""
+        except ValueError:
+            return ""
+
     def _on_restart(self) -> None:
         paths = self._collect_checked().get("working", [])
         if paths:
@@ -1150,6 +1347,135 @@ class ReportBrowser(QWidget):
         paths = self._collect_checked().get("reject", [])
         if paths:
             self.restore_requested.emit(paths)
+
+    # ------------------------------------------------------------------ #
+    #  Chat panel                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _save_chat_state(self) -> None:
+        if self._current_file is None:
+            return
+        html = self._chat_history.toHtml()
+        # Only save if there's actual content (toHtml returns a full doc even when empty)
+        has_content = self._chat_history.isVisible()
+        if has_content:
+            self._chat_state[self._current_file] = (html, self._chat_pending_content)
+        else:
+            self._chat_state.pop(self._current_file, None)
+
+    def _restore_chat_state(self, path: Path) -> None:
+        state = self._chat_state.get(path)
+        if state:
+            html, pending = state
+            self._chat_history.setHtml(html)
+            self._chat_history.setVisible(True)
+            sb = self._chat_history.verticalScrollBar()
+            sb.setValue(sb.maximum())
+            self._chat_pending_content = pending
+            self._chat_apply_bar.setVisible(pending is not None)
+        else:
+            self._unload_chat_ui()
+
+    def _unload_chat_ui(self) -> None:
+        """Reset chat UI to empty state without touching _chat_state."""
+        self._chat_history.setHtml("")
+        self._chat_history.setVisible(False)
+        self._chat_pending_content = None
+        self._chat_apply_bar.setVisible(False)
+        self._chat_in_progress = False
+
+    def _clear_chat(self) -> None:
+        """Clear chat history for the current file (removes saved state too)."""
+        if self._current_file is not None:
+            self._chat_state.pop(self._current_file, None)
+        self._unload_chat_ui()
+
+    def _on_send_chat(self) -> None:
+        if self._chat_in_progress or not self._current_file:
+            return
+        message = self._chat_input.text().strip()
+        if not message:
+            return
+        self._chat_input.clear()
+        self._chat_send_btn.setEnabled(False)
+        self._chat_in_progress = True
+        self._append_chat_msg("user", message)
+        lang = self._chat_lang_combo.currentData()
+        self._chat_task = asyncio.ensure_future(
+            self._do_chat(self._current_file, message, lang)
+        )
+        self._chat_task.add_done_callback(self._on_chat_task_done)
+
+    def _on_chat_task_done(self, task: asyncio.Task) -> None:
+        self._chat_task = None
+        if not task.cancelled() and task.exception() is not None:
+            self._append_chat_msg("error", f"오류: {task.exception()}")
+
+    async def _do_chat(self, original_path: Path, message: str, lang: str) -> None:
+        from ..engine.executor import chat_with_plan
+        try:
+            response, proposed = await chat_with_plan(original_path, message, lang)
+            self._append_chat_msg("claude", response, proposed_content=proposed)
+            if proposed:
+                self._chat_pending_content = proposed
+                self._chat_apply_bar.setVisible(True)
+                if self._chat_auto_apply.isChecked():
+                    self._on_apply_chat_change()
+        except Exception as e:
+            self._append_chat_msg("error", f"오류: {e}")
+        finally:
+            self._chat_send_btn.setEnabled(True)
+            self._chat_in_progress = False
+
+    def _append_chat_msg(
+        self, role: str, text: str, proposed_content: str | None = None
+    ) -> None:
+        import html as html_lib
+        safe = html_lib.escape(text).replace("\n", "<br>")
+        if role == "user":
+            block = (
+                f'<div style="margin:6px 0; text-align:right;">'
+                f'<span style="background:#0e4e8a;color:#ccc;padding:4px 10px;'
+                f'border-radius:6px;display:inline-block;max-width:85%;font-size:12px;'
+                f'word-break:break-word;">{safe}</span></div>'
+            )
+        elif role == "claude":
+            file_note = ""
+            if proposed_content is not None:
+                file_note = (
+                    '<div style="color:#66bb6a;font-size:11px;margin-top:4px;">'
+                    '📝 파일 수정 제안 있음</div>'
+                )
+            block = (
+                f'<div style="margin:6px 0;">'
+                f'<span style="color:#666;font-size:10px;">Claude</span>'
+                f'<div style="background:#2a2a2a;color:#d4d4d4;padding:6px 10px;'
+                f'border-radius:6px;font-size:12px;margin-top:2px;word-break:break-word;">'
+                f'{safe}{file_note}</div></div>'
+            )
+        else:  # error
+            block = (
+                f'<div style="margin:6px 0;color:#ef5350;font-size:12px;">{safe}</div>'
+            )
+        self._chat_history.setVisible(True)
+        self._chat_history.append(block)
+        sb = self._chat_history.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_apply_chat_change(self) -> None:
+        if not self._chat_pending_content or not self._current_file:
+            return
+        try:
+            self._current_file.write_text(self._chat_pending_content, encoding="utf-8")
+            self._chat_pending_content = None
+            self._chat_apply_bar.setVisible(False)
+            # Update saved state: clear pending but keep history
+            if self._current_file in self._chat_state:
+                html, _ = self._chat_state[self._current_file]
+                self._chat_state[self._current_file] = (html, None)
+            self._show_file(self._current_file)
+        except Exception as e:
+            QMessageBox.warning(self, "저장 실패", f"파일 저장 실패: {e}")
 
 
 # ---------------------------------------------------------------------------

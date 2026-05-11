@@ -70,6 +70,12 @@ class _SoundPlayer:
         self._loop_active = False
         self._loop.stop()
 
+    def cleanup(self) -> None:
+        """Stop all playback before QApplication teardown."""
+        self._loop_active = False
+        self._loop.stop()
+        self._fx.stop()
+
     # ------------------------------------------------------------------ #
 
     def _play_next_loop(self) -> None:
@@ -85,6 +91,12 @@ class _SoundPlayer:
 
 # Module-level singleton — imported after QApplication is constructed (safe).
 _player = _SoundPlayer()
+
+# Stop all playback before Qt tears down its multimedia backend.
+from PySide6.QtWidgets import QApplication as _QApplication  # noqa: E402
+_app = _QApplication.instance()
+if _app is not None:
+    _app.aboutToQuit.connect(_player.cleanup)
 
 
 def play(name: str) -> None:

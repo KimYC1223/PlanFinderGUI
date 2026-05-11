@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    RateLimitEvent,
     ResultMessage,
     ToolUseBlock,
     query,
@@ -118,6 +119,15 @@ async def discover_plan(
                             on_activity(detail)
                 if has_tool_use:
                     turns += 1
+                if message.error:
+                    raise RuntimeError(f"Claude API error: {message.error}")
+            elif isinstance(message, RateLimitEvent):
+                if message.rate_limit_info.status == "rejected":
+                    raise RuntimeError(
+                        f"rate_limit: Rate limit rejected"
+                        f" (type={message.rate_limit_info.rate_limit_type},"
+                        f" resets_at={message.rate_limit_info.resets_at})"
+                    )
             elif isinstance(message, ResultMessage):
                 last_result_subtype = message.subtype
                 cost = message.total_cost_usd or 0.0

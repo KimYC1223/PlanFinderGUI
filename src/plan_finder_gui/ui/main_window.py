@@ -783,6 +783,18 @@ class MainWindow(QMainWindow):
         self.config_panel.stop_btn.setEnabled(True)
 
     def _on_session_unregistered(self, session: Session) -> None:
+        # Disconnect all lambda slots so the adapter and its captured references are freed.
+        a = session.adapter
+        for sig in (
+            a.log_message, a.activity_updated, a.iteration_started,
+            a.cost_updated, a.plan_approved, a.plan_rejected, a.plan_pending,
+            a.no_more_plans, a.session_finished, a.error_occurred,
+        ):
+            try:
+                sig.disconnect()
+            except RuntimeError:
+                pass  # already disconnected
+
         if not self._session_manager.any_running():
             sound_player.stop_working_loop()
             self.status_bar_widget.set_running(False)
@@ -973,6 +985,7 @@ class MainWindow(QMainWindow):
 
         self.config_panel.save_settings()
         self.stop_session()
+        sound_player.stop_working_loop()
         if getattr(self, "_tray", None) is not None:
             self._tray.hide()
         event.accept()
