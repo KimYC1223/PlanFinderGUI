@@ -289,11 +289,10 @@ class ReportBrowser(QWidget):
         self._current_file: Path | None = None   # original path of displayed file
         self._viewing_original: bool = False     # True → showing original even when translation exists
         self._suppress_click_deselect: bool = False  # set when itemChanged just previewed; itemClicked must not undo it
-        self._chat_pending_content: str | None = None  # Claude's proposed file content
         self._chat_in_progress: bool = False
         self._chat_task: asyncio.Task | None = None
-        # Per-file chat state: path → (history_html, pending_content)
-        self._chat_state: dict[Path, tuple[str, str | None]] = {}
+        self._chat_blocks: dict[Path, list[str]] = {}   # per-file HTML block fragments
+        self._chat_pending: dict[Path, str | None] = {}  # per-file pending proposed content
 
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_fs_change)
@@ -605,12 +604,13 @@ class ReportBrowser(QWidget):
         self._purge_stale_chat_state()
 
     def _purge_stale_chat_state(self) -> None:
-        """Remove _chat_state entries for files that no longer exist on disk."""
-        if not self._chat_state:
+        """Remove chat state for files that no longer exist on disk."""
+        if not self._chat_blocks:
             return
-        stale = [p for p in self._chat_state if not p.exists()]
+        stale = [p for p in self._chat_blocks if not p.exists()]
         for p in stale:
-            del self._chat_state[p]
+            del self._chat_blocks[p]
+            self._chat_pending.pop(p, None)
 
     def set_running(self, running: bool) -> None:
         self._is_running = running
@@ -665,7 +665,6 @@ class ReportBrowser(QWidget):
         self._update_buttons()
 
     def _deselect_file(self) -> None:
-        self._save_chat_state()
         self._current_file = None
         self._viewing_original = False
         self._right_widget.setVisible(False)
@@ -674,7 +673,6 @@ class ReportBrowser(QWidget):
     def _show_file(self, original: Path) -> None:
         was_hidden = not self._right_widget.isVisible()
         if original != self._current_file:
-            self._save_chat_state()
             self._viewing_original = False
             self._restore_chat_state(original)
         self._current_file = original
@@ -1281,10 +1279,8 @@ class ReportBrowser(QWidget):
                 "Cannot resolve while another session is running" if self._is_running else ""
             )
             self._reject_btn_a.setVisible(True)
-            self._reject_btn_a.setEnabled(not self._is_running)
-            self._reject_btn_a.setToolTip(
-                "Cannot reject while another session is running" if self._is_running else ""
-            )
+            self._reject_btn_a.setEnabled(True)
+            self._reject_btn_a.setToolTip("")
             self._share_btn.setVisible(True)
         elif cats == {"working"}:
             self._restart_btn.setVisible(True)
@@ -1360,42 +1356,32 @@ class ReportBrowser(QWidget):
     #  Chat panel                                                          #
     # ------------------------------------------------------------------ #
 
-    def _save_chat_state(self) -> None:
-        if self._current_file is None:
-            return
-        html = self._chat_history.toHtml()
-        # Only save if there's actual content (toHtml returns a full doc even when empty)
-        has_content = self._chat_history.isVisible()
-        if has_content:
-            self._chat_state[self._current_file] = (html, self._chat_pending_content)
-        else:
-            self._chat_state.pop(self._current_file, None)
-
     def _restore_chat_state(self, path: Path) -> None:
-        state = self._chat_state.get(path)
-        if state:
-            html, pending = state
-            self._chat_history.setHtml(html)
+        blocks = self._chat_blocks.get(path, [])
+        pending = self._chat_pending.get(path)
+        self._chat_history.setHtml("")
+        if blocks:
+            for block in blocks:
+                self._chat_history.append(block)
             self._chat_history.setVisible(True)
             sb = self._chat_history.verticalScrollBar()
             sb.setValue(sb.maximum())
-            self._chat_pending_content = pending
-            self._chat_apply_bar.setVisible(pending is not None)
         else:
-            self._unload_chat_ui()
+            self._chat_history.setVisible(False)
+        self._chat_apply_bar.setVisible(pending is not None)
 
     def _unload_chat_ui(self) -> None:
-        """Reset chat UI to empty state without touching _chat_state."""
+        """Reset chat UI to empty state without touching per-file state dicts."""
         self._chat_history.setHtml("")
         self._chat_history.setVisible(False)
-        self._chat_pending_content = None
         self._chat_apply_bar.setVisible(False)
         self._chat_in_progress = False
 
     def _clear_chat(self) -> None:
-        """Clear chat history for the current file (removes saved state too)."""
+        """Clear chat history for the current file and remove its saved state."""
         if self._current_file is not None:
-            self._chat_state.pop(self._current_file, None)
+            self._chat_blocks.pop(self._current_file, None)
+            self._chat_pending.pop(self._current_file, None)
         self._unload_chat_ui()
 
     def _on_send_chat(self) -> None:
@@ -1422,29 +1408,36 @@ class ReportBrowser(QWidget):
     async def _do_chat(self, original_path: Path, message: str, lang: str) -> None:
         from ..engine.executor import chat_with_plan
         try:
-            response, proposed = await chat_with_plan(original_path, message, lang)
-            self._append_chat_msg("claude", response, proposed_content=proposed)
+            response, proposed = await chat_with_plan(
+                original_path, message, lang,
+                on_activity=lambda detail: self._on_chat_activity(original_path, detail),
+            )
+            self._append_chat_msg("claude", response, target_path=original_path, proposed_content=proposed)
             if proposed:
-                self._chat_pending_content = proposed
-                self._chat_apply_bar.setVisible(True)
-                if self._chat_auto_apply.isChecked():
-                    self._on_apply_chat_change()
+                self._chat_pending[original_path] = proposed
+                if self._current_file == original_path:
+                    self._chat_apply_bar.setVisible(True)
+                    if self._chat_auto_apply.isChecked():
+                        self._on_apply_chat_change()
         except Exception as e:
-            self._append_chat_msg("error", f"오류: {e}")
+            self._append_chat_msg("error", f"오류: {e}", target_path=original_path)
         finally:
             self._chat_send_btn.setEnabled(True)
             self._chat_in_progress = False
 
-    def _append_chat_msg(
+    def _on_chat_activity(self, path: Path, detail: str) -> None:
+        self._append_chat_msg("activity", detail, target_path=path)
+
+    def _build_chat_html_block(
         self, role: str, text: str, proposed_content: str | None = None
-    ) -> None:
+    ) -> str:
         import html as html_lib
         safe = html_lib.escape(text).replace("\n", "<br>")
         if role == "user":
-            block = (
+            return (
                 f'<div style="margin:6px 0; text-align:right;">'
-                f'<span style="background:#0e4e8a;color:#ccc;padding:4px 10px;'
-                f'border-radius:6px;display:inline-block;max-width:85%;font-size:12px;'
+                f'<span style="background:#0e4e8a;color:#ddd;padding:8px 14px;'
+                f'border-radius:14px;display:inline-block;max-width:85%;font-size:12px;'
                 f'word-break:break-word;">{safe}</span></div>'
             )
         elif role == "claude":
@@ -1454,33 +1447,49 @@ class ReportBrowser(QWidget):
                     '<div style="color:#66bb6a;font-size:11px;margin-top:4px;">'
                     '📝 파일 수정 제안 있음</div>'
                 )
-            block = (
+            return (
                 f'<div style="margin:6px 0;">'
                 f'<span style="color:#666;font-size:10px;">Claude</span>'
-                f'<div style="background:#2a2a2a;color:#d4d4d4;padding:6px 10px;'
-                f'border-radius:6px;font-size:12px;margin-top:2px;word-break:break-word;">'
+                f'<div style="background:#2a2a2a;color:#d4d4d4;padding:8px 12px;'
+                f'border-radius:12px;font-size:12px;margin-top:2px;word-break:break-word;">'
                 f'{safe}{file_note}</div></div>'
             )
+        elif role == "activity":
+            return (
+                f'<div style="margin:1px 0 1px 8px;color:#555;font-size:10px;'
+                f'font-style:italic;">↳ {safe}</div>'
+            )
         else:  # error
-            block = (
+            return (
                 f'<div style="margin:6px 0;color:#ef5350;font-size:12px;">{safe}</div>'
             )
-        self._chat_history.setVisible(True)
-        self._chat_history.append(block)
-        sb = self._chat_history.verticalScrollBar()
-        sb.setValue(sb.maximum())
+
+    def _append_chat_msg(
+        self, role: str, text: str, target_path: Path | None = None,
+        proposed_content: str | None = None
+    ) -> None:
+        block = self._build_chat_html_block(role, text, proposed_content)
+        path = target_path if target_path is not None else self._current_file
+        if path is not None:
+            if path not in self._chat_blocks:
+                self._chat_blocks[path] = []
+            self._chat_blocks[path].append(block)
+        if target_path is None or target_path == self._current_file:
+            self._chat_history.setVisible(True)
+            self._chat_history.append(block)
+            sb = self._chat_history.verticalScrollBar()
+            sb.setValue(sb.maximum())
 
     def _on_apply_chat_change(self) -> None:
-        if not self._chat_pending_content or not self._current_file:
+        if not self._current_file:
+            return
+        proposed = self._chat_pending.get(self._current_file)
+        if not proposed:
             return
         try:
-            self._current_file.write_text(self._chat_pending_content, encoding="utf-8")
-            self._chat_pending_content = None
+            self._current_file.write_text(proposed, encoding="utf-8")
+            self._chat_pending[self._current_file] = None
             self._chat_apply_bar.setVisible(False)
-            # Update saved state: clear pending but keep history
-            if self._current_file in self._chat_state:
-                html, _ = self._chat_state[self._current_file]
-                self._chat_state[self._current_file] = (html, None)
             self._show_file(self._current_file)
         except Exception as e:
             QMessageBox.warning(self, "저장 실패", f"파일 저장 실패: {e}")

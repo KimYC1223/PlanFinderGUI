@@ -612,6 +612,7 @@ async def chat_with_plan(
     original_path: Path,
     message: str,
     response_lang: str,
+    on_activity: object = None,  # Callable[[str], None] | None
 ) -> tuple[str, str | None]:
     """Chat with Claude about a plan file.
 
@@ -674,6 +675,12 @@ async def chat_with_plan(
                     response_parts.append(block.text)
                 elif isinstance(block, ToolUseBlock) and block.name in ("Edit", "Write"):
                     file_was_written = True
+                    if on_activity:
+                        try:
+                            from .tool_summary import summarize_tool
+                            on_activity(summarize_tool(block.name, block.input))
+                        except Exception:
+                            pass
 
     response_text = "".join(response_parts).strip() or "(응답 없음)"
 

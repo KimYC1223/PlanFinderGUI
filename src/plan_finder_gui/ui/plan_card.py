@@ -41,6 +41,8 @@ _EFFORT_LABELS = {
     "epic":    "XL",
 }
 
+_PRIORITY_LABELS = {1: "심각", 2: "매우 높음", 3: "높음", 4: "보통", 5: "낮음"}
+
 
 class PlanCard(QWidget):
     """Displays a discovered plan and collects user approval.
@@ -286,8 +288,8 @@ class PlanCard(QWidget):
         effort = _EFFORT_LABELS.get(plan.estimated_effort.value, plan.estimated_effort.value)
         self._effort_badge.setText(f"Effort: {effort}")
 
-        priority_dots = "●" * (6 - plan.priority) + "○" * (plan.priority - 1)
-        self._priority_label.setText(f"Priority {plan.priority}/5  {priority_dots}")
+        priority_text = _PRIORITY_LABELS.get(plan.priority, str(plan.priority))
+        self._priority_label.setText(f"우선순위: {priority_text}")
 
         self._iteration_label.setText(f"#{iteration}")
         self._title_label.setText(plan.title)
