@@ -1378,31 +1378,42 @@ class MainWindow(QMainWindow):
             if trans and trans.exists():
                 new_entries[f"translated/{trans.name}"] = trans
 
-        existing_entries: list[tuple[str, bytes]] = []
+        existing_entries: list[tuple[zipfile.ZipInfo, bytes]] = []
         if archive_path.exists():
             try:
                 with zipfile.ZipFile(archive_path, "r") as zin:
                     for info in zin.infolist():
                         if info.is_dir() or info.filename in new_entries:
                             continue
-                        existing_entries.append((info.filename, zin.read(info.filename)))
+                        existing_entries.append((info, zin.read(info)))
             except (zipfile.BadZipFile, OSError) as e:
                 self.log_panel.append_log(
                     f"기존 공유 zip 읽기 실패 ({archive_path.name}): {e}", "warn"
                 )
                 existing_entries = []
 
+        # Write to a sibling temp file, then atomically replace the target so a
+        # crash mid-write cannot leave a half-truncated archive behind.
         errors: list[str] = []
+        tmp_path = archive_path.with_name(archive_path.name + ".tmp")
         try:
-            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zout:
-                for arcname, data in existing_entries:
-                    zout.writestr(arcname, data)
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                # Preserve original ZipInfo (timestamp, permissions, create_system)
+                # so extractors don't reject the rebuilt entries as malformed.
+                for info, data in existing_entries:
+                    zout.writestr(info, data)
                 for arcname, fp in new_entries.items():
                     try:
                         zout.write(fp, arcname)
                     except OSError as e:
                         errors.append(f"{fp.name}: {e}")
+            tmp_path.replace(archive_path)
         except OSError as e:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
             sound_player.play_random("tscerr00.wav", "tscerr01.wav")
             QMessageBox.warning(self, "공유 실패", f"zip 작성 실패: {e}")
             return

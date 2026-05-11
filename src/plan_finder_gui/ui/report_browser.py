@@ -1285,7 +1285,7 @@ class ReportBrowser(QWidget):
         elif cats == {"working"}:
             self._restart_btn.setVisible(True)
             self._restart_btn.setEnabled(not self._is_running)
-        elif cats == {"reject"}:
+        elif cats == {"reject"} or cats == {"reviewed"}:
             self._restore_btn.setVisible(True)
 
     # ------------------------------------------------------------------ #
@@ -1348,7 +1348,8 @@ class ReportBrowser(QWidget):
             self.restart_requested.emit(paths)
 
     def _on_restore(self) -> None:
-        paths = self._collect_checked().get("reject", [])
+        checked = self._collect_checked()
+        paths = checked.get("reject", []) + checked.get("reviewed", [])
         if paths:
             self.restore_requested.emit(paths)
 
