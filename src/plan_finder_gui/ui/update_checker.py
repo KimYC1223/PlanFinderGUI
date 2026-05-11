@@ -83,10 +83,12 @@ class UpdateChecker(QObject):
         self,
         parent: QWidget,
         current_version: str,
+        manual: bool = False,
     ) -> None:
         super().__init__(parent)
         self._parent_widget = parent
         self._current = current_version
+        self._manual = manual
         self._thread: QThread | None = None
         self._worker: _ReleaseFetcher | None = None
 
@@ -108,19 +110,43 @@ class UpdateChecker(QObject):
             self._thread = None
         self._worker = None
 
-    def _on_failed(self, _msg: str) -> None:
-        # Silent: network errors, rate limiting, no releases yet, etc.
-        return
+    def _on_failed(self, msg: str) -> None:
+        # Silent on auto-check (network errors, rate limiting, etc.).
+        # On manual check, surface the error so the user knows the click did
+        # something.
+        if not self._manual:
+            return
+        box = QMessageBox(self._parent_widget)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("업데이트 확인")
+        box.setText(
+            "업데이트 정보를 가져오지 못했습니다.\n"
+            "네트워크 연결을 확인하고 잠시 후 다시 시도해주세요."
+        )
+        if msg:
+            box.setDetailedText(msg)
+        box.exec()
 
     def _on_found(self, tag: str, url: str) -> None:
         if not is_newer(tag, self._current):
+            if self._manual:
+                box = QMessageBox(self._parent_widget)
+                box.setIcon(QMessageBox.Icon.Information)
+                box.setWindowTitle("업데이트 확인")
+                box.setText(
+                    f"현재 최신 버전을 사용하고 있습니다.\n\n"
+                    f"현재 버전: {self._current}\n"
+                    f"최신 버전: {tag}"
+                )
+                box.exec()
             return
 
-        from PySide6.QtCore import QSettings
-        settings = QSettings()
-        skipped = str(settings.value(self._SKIP_KEY, "") or "")
-        if skipped and _parse_version(skipped) >= _parse_version(tag):
-            return
+        if not self._manual:
+            from PySide6.QtCore import QSettings
+            settings = QSettings()
+            skipped = str(settings.value(self._SKIP_KEY, "") or "")
+            if skipped and _parse_version(skipped) >= _parse_version(tag):
+                return
 
         self._prompt(tag, url)
 
@@ -149,8 +175,17 @@ class UpdateChecker(QObject):
         # later_btn: do nothing, ask again next launch
 
 
-def check_for_updates(parent: QWidget, current_version: Optional[str] = None) -> UpdateChecker:
-    """Convenience entry point: start a background update check."""
+def check_for_updates(
+    parent: QWidget,
+    current_version: Optional[str] = None,
+    manual: bool = False,
+) -> UpdateChecker:
+    """Convenience entry point: start a background update check.
+
+    When ``manual`` is True the checker reports outcomes the silent auto-check
+    suppresses (already up-to-date, fetch failures) so a menu-triggered click
+    always produces visible feedback.
+    """
     if current_version is None:
         try:
             from importlib.metadata import version
@@ -158,6 +193,6 @@ def check_for_updates(parent: QWidget, current_version: Optional[str] = None) ->
         except Exception:
             from .. import __version__ as current_version  # type: ignore
 
-    checker = UpdateChecker(parent, current_version=current_version)
+    checker = UpdateChecker(parent, current_version=current_version, manual=manual)
     checker.start()
     return checker

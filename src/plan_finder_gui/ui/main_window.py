@@ -109,6 +109,13 @@ class MainWindow(QMainWindow):
 
         app_menu.addSeparator()
 
+        update_act = QAction("업데이트 확인", self)
+        update_act.setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+        update_act.triggered.connect(self._check_for_updates_manual)
+        app_menu.addAction(update_act)
+
+        app_menu.addSeparator()
+
         pref_act = QAction("환경설정...", self)
         pref_act.setShortcut("Ctrl+,")
         pref_act.setMenuRole(QAction.MenuRole.PreferencesRole)
@@ -204,6 +211,11 @@ class MainWindow(QMainWindow):
         # Settings may have changed the preset directory — refresh the dropdown.
         if hasattr(self, "config_panel"):
             self.config_panel.refresh_presets()
+
+    def _check_for_updates_manual(self) -> None:
+        from .update_checker import check_for_updates
+        # Keep a reference so the worker thread isn't garbage-collected mid-fetch.
+        self._manual_update_checker = check_for_updates(self, manual=True)
 
     def _show_about(self) -> None:
         import sys
@@ -437,6 +449,7 @@ class MainWindow(QMainWindow):
         self.report_browser.reject_requested.connect(self._on_reject_requested)
         self.report_browser.restart_requested.connect(self._on_restart_requested)
         self.report_browser.restore_requested.connect(self._on_restore_requested)
+        self.report_browser.share_requested.connect(self._on_share_requested)
 
         # Update report dir when project dir changes
         self.config_panel.project_dir_edit.textChanged.connect(self._on_project_dir_changed)
@@ -1332,6 +1345,108 @@ class MainWindow(QMainWindow):
                     )
 
         self.report_browser.refresh()
+
+    def _on_share_requested(self, paths: list, member: str) -> None:
+        """Bundle pending plans into ~/Desktop/claude-reports/<project>/<member>.zip.
+
+        If the archive already exists, existing entries are preserved and any
+        new entry with a colliding archive name replaces the old one. After
+        bundling, plans destined for someone other than the user are moved to
+        reviewed/ (mirroring the team-distribute flow).
+        """
+        import zipfile
+        from .report_browser import (
+            _desktop_dir,
+            _find_translated_in_pending,
+            _safe_dirname,
+        )
+
+        plan_paths = [Path(p) for p in paths if Path(p).exists()]
+        if not plan_paths or not member:
+            return
+
+        report_dir = self._get_report_dir()
+        project_name = report_dir.name
+        base_dir = _desktop_dir() / "claude-reports" / project_name
+        base_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = base_dir / f"{_safe_dirname(member)}.zip"
+
+        new_entries: dict[str, Path] = {}
+        for fp in plan_paths:
+            new_entries[fp.name] = fp
+            trans = _find_translated_helper(fp)
+            if trans and trans.exists():
+                new_entries[f"translated/{trans.name}"] = trans
+
+        existing_entries: list[tuple[str, bytes]] = []
+        if archive_path.exists():
+            try:
+                with zipfile.ZipFile(archive_path, "r") as zin:
+                    for info in zin.infolist():
+                        if info.is_dir() or info.filename in new_entries:
+                            continue
+                        existing_entries.append((info.filename, zin.read(info.filename)))
+            except (zipfile.BadZipFile, OSError) as e:
+                self.log_panel.append_log(
+                    f"기존 공유 zip 읽기 실패 ({archive_path.name}): {e}", "warn"
+                )
+                existing_entries = []
+
+        errors: list[str] = []
+        try:
+            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                for arcname, data in existing_entries:
+                    zout.writestr(arcname, data)
+                for arcname, fp in new_entries.items():
+                    try:
+                        zout.write(fp, arcname)
+                    except OSError as e:
+                        errors.append(f"{fp.name}: {e}")
+        except OSError as e:
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            QMessageBox.warning(self, "공유 실패", f"zip 작성 실패: {e}")
+            return
+
+        s = QSettings()
+        my_name = str(s.value("team/my_name", "") or "").strip()
+        if member != my_name:
+            reviewed_dir = report_dir / "reviewed"
+            reviewed_dir.mkdir(parents=True, exist_ok=True)
+            pending_dir = report_dir / "pending"
+            for fp in plan_paths:
+                if not fp.exists():
+                    continue
+                old_trans = _find_translated_in_pending(pending_dir, fp.name)
+                try:
+                    fp.rename(reviewed_dir / fp.name)
+                except OSError as e:
+                    errors.append(f"{fp.name} 이동 실패: {e}")
+                    continue
+                if old_trans and old_trans.exists():
+                    new_trans_dir = reviewed_dir / "translated"
+                    new_trans_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        old_trans.rename(new_trans_dir / old_trans.name)
+                    except OSError as e:
+                        errors.append(f"{old_trans.name} 이동 실패: {e}")
+
+        self.report_browser.refresh()
+
+        summary = (
+            f"'{member}' 공유 압축본을 갱신했습니다.\n"
+            f"위치: {archive_path}\n"
+            f"추가/대체된 항목: {len(new_entries)}개"
+        )
+        if errors:
+            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+            QMessageBox.warning(
+                self,
+                "공유 일부 실패",
+                summary + "\n\n다음 항목에서 문제가 발생했습니다:\n" + "\n".join(errors),
+            )
+        else:
+            sound_player.play("trescue.wav")
+            QMessageBox.information(self, "공유 완료", summary)
 
     def _on_restart_requested(self, paths: list) -> None:
         """Files are already in working/; start resolve session directly."""
