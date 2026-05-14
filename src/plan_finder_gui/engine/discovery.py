@@ -173,6 +173,13 @@ async def discover_plan(
             await asyncio.sleep(0.2)
         except Exception:
             pass
+
+        # Rate limit errors are handled (wait + retry) by the caller in engine.py.
+        # Don't show a popup — just propagate silently.
+        err_str = str(e).lower()
+        if "rate_limit" in err_str or "rate limit" in err_str:
+            raise
+
         summary = "discover_plan 실행 중 예외가 발생했습니다."
         resolved_cli = getattr(options, "cli_path", None)
         if resolved_cli:

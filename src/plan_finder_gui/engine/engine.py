@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from pathlib import Path
 
 from .discovery import discover_plan
@@ -83,11 +85,30 @@ async def _wait_if_quiet_hours(display: DisplayInterface) -> None:
         display.log("Quiet hours over, resuming...")
 
 
+def _extract_resets_at(err_msg: str) -> float | None:
+    """Extract resets_at Unix timestamp from a rate limit error message."""
+    m = re.search(r'resets_at=(\d+)', err_msg)
+    return float(m.group(1)) if m else None
+
+
 async def _wait_for_next_session(
-    display: DisplayInterface, throttle: SessionThrottle | None
+    display: DisplayInterface, throttle: SessionThrottle | None, err_msg: str = ""
 ) -> None:
-    """Wait until the current session ends, then return."""
+    """Wait until the rate limit or session window resets, then return."""
     from datetime import datetime
+
+    # Prefer the exact resets_at timestamp from the API response when available.
+    resets_at = _extract_resets_at(err_msg)
+    if resets_at:
+        wait_secs = resets_at - time.time()
+        if wait_secs > 0:
+            wake = datetime.fromtimestamp(resets_at)
+            display.log(
+                f"Rate limit resets at {wake.strftime('%H:%M:%S')}. "
+                f"Waiting {wait_secs / 60:.0f} min..."
+            )
+            await asyncio.sleep(wait_secs + 5)  # +5s buffer
+            return
 
     if throttle and throttle.session_ready:
         now = datetime.now()
@@ -228,7 +249,7 @@ async def run_discovery_loop(
                     break
                 if _is_rate_limit_error(err_msg):
                     display.on_error("Rate limit reached. Waiting for next session...")
-                    await _wait_for_next_session(display, throttle)
+                    await _wait_for_next_session(display, throttle, err_msg)
                     session_id = None
                     session_start_time = _dt.now()
                     if throttle:
@@ -253,7 +274,7 @@ async def run_discovery_loop(
                             "Too many consecutive errors. "
                             "Treating as rate limit and waiting for next session..."
                         )
-                        await _wait_for_next_session(display, throttle)
+                        await _wait_for_next_session(display, throttle, err_msg)
                         session_id = None
                         session_start_time = _dt.now()
                         if throttle:
@@ -367,7 +388,7 @@ async def run_discovery_loop(
                                         f"Failed to save original plan: {save_err}"
                                     )
                                 display.log("Waiting for next session...")
-                                await _wait_for_next_session(display, throttle)
+                                await _wait_for_next_session(display, throttle, err_msg)
                                 session_id = None
                                 session_start_time = _dt.now()
                                 if throttle:
