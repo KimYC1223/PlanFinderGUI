@@ -200,9 +200,10 @@ async def discover_plan(
                     f"'최대 턴' 값을 늘려보세요."
                 )
         stderr_text = stderr_buf.text()
+        is_api_error = str(e).lower().startswith("claude api error")
         if stderr_text:
             summary += f"\n\nClaude CLI stderr:\n{stderr_text}"
-        elif not last_result_subtype:
+        elif not last_result_subtype and not is_api_error:
             summary += (
                 "\n\nClaude CLI stderr: (비어있음 — CLI가 stderr 출력 없이 즉시 종료됨)"
                 "\n→ 터미널에서 `claude -v` 와 `claude` 를 직접 실행하여 인증/버전을 확인하세요."

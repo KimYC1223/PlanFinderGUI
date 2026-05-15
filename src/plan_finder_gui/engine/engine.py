@@ -48,6 +48,7 @@ def _is_retriable_error(err_msg: str) -> bool:
         or "command failed" in lower
         or "connection" in lower
         or "timeout" in lower
+        or "claude api error" in lower
     )
 
 
