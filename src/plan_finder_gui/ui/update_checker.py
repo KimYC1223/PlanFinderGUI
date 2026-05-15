@@ -2,9 +2,27 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from typing import Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """Build an SSL context with a CA bundle that works in frozen apps.
+
+    macOS python.org installers and PyInstaller-built .app bundles often lack
+    a usable system trust store, which makes urlopen raise
+    CERTIFICATE_VERIFY_FAILED. Prefer certifi's bundle when available.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+_SSL_CONTEXT = _build_ssl_context()
 
 from PySide6.QtCore import QObject, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -55,7 +73,7 @@ class _ReleaseFetcher(QObject):
                     "User-Agent": "PlanFinderGUI-update-check",
                 },
             )
-            with urlopen(req, timeout=5) as resp:
+            with urlopen(req, timeout=5, context=_SSL_CONTEXT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except (URLError, TimeoutError, ValueError, OSError) as e:
             self.failed.emit(str(e))

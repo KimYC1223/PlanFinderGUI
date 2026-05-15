@@ -28,6 +28,7 @@ a = Analysis(
         'qasync',
         'markdown',
         'psutil',
+        'certifi',
     ],
     hookspath=[],
     hooksconfig={},
