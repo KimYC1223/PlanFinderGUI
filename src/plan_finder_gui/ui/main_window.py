@@ -757,8 +757,16 @@ class MainWindow(QMainWindow):
             is_resolve=False,
         )
 
-    def stop_session(self) -> None:
-        cancelled = self._session_manager.cancel_all()
+    def stop_session(self, wait: bool = False) -> None:
+        """Stop all running sessions.
+
+        Args:
+            wait: If True, blocks while waiting for subprocess termination.
+                  If False (default), sends SIGTERM but returns immediately
+                  to keep the UI responsive. The delayed unregister() call
+                  in _on_session_task_done will handle final cleanup.
+        """
+        cancelled = self._session_manager.cancel_all(wait_for_termination=wait)
         for sess in self._session_manager.list():
             sess.adapter.cancel_pending()
         if cancelled:

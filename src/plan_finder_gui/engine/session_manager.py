@@ -106,12 +106,67 @@ class Session(QObject):
         self.cpu_history.append(normalized)
         return normalized
 
-    def cancel(self) -> bool:
+    def cancel(self, wait: bool = True) -> bool:
+        """Cancel the session task and optionally terminate subprocesses.
+
+        Args:
+            wait: If True, blocks while waiting for subprocess termination.
+                  If False, sends termination signals but returns immediately.
+
+        Returns:
+            True if the task was running and was cancelled, False otherwise.
+        """
         if self.task and not self.task.done():
             self.task.cancel()
-            self.terminate_procs()
+            if wait:
+                self.terminate_procs()
+            else:
+                self.terminate_procs_nowait()
             return True
         return False
+
+    def terminate_procs_nowait(self) -> None:
+        """Send SIGTERM to all subprocesses without waiting for exit.
+
+        This is a fire-and-forget variant for use when the app is closing
+        or when immediate return is required. Processes that don't exit
+        gracefully will be cleaned up by the OS or by a subsequent
+        drop_dead() call.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+
+        for proc in list(self._procs.values()):
+            try:
+                if proc.is_running():
+                    proc.terminate()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.AccessDenied:
+                import logging
+                logging.warning(
+                    f"Access denied when terminating PID {proc.pid}; "
+                    "may require elevated privileges"
+                )
+            except Exception as e:
+                import logging
+                logging.warning(f"Error terminating PID {proc.pid}: {e}")
+
+        # Clear process tracking - cleanup will happen via drop_dead() or OS
+        self._procs.clear()
+
+    async def terminate_procs_async(self, timeout: float = 5.0) -> None:
+        """Asynchronously terminate all subprocesses owned by this session.
+
+        This method runs the blocking psutil wait() calls in a thread pool
+        so the Qt main thread remains responsive.
+
+        Args:
+            timeout: Maximum seconds to wait for graceful termination.
+        """
+        await asyncio.to_thread(self.terminate_procs, timeout)
 
     def terminate_procs(self, timeout: float = 5.0) -> None:
         """Terminate all subprocesses owned by this session.
@@ -231,8 +286,15 @@ class SessionManager(QObject):
         self.session_state_changed.emit(session)
 
     def unregister(self, session: Session) -> None:
-        # Terminate any lingering subprocesses before cleanup
-        session.terminate_procs(timeout=2.0)
+        """Unregister a session and clean up its subprocess tracking.
+
+        Uses non-blocking termination to avoid freezing the UI during cleanup.
+        Any lingering processes will be terminated via SIGTERM; the OS or
+        subsequent drop_dead() calls handle stragglers.
+        """
+        # Send termination signals without blocking - by this point the session
+        # task is already done, so we don't need to wait for process exit.
+        session.terminate_procs_nowait()
         self._sessions.pop(session.id, None)
         for pid in session.claimed_pids():
             self._claimed_pids.discard(pid)
@@ -248,15 +310,16 @@ class SessionManager(QObject):
         """Cancel all running sessions and terminate their subprocesses.
 
         Args:
-            wait_for_termination: If True, blocks briefly while subprocesses
-                are terminated. If False, termination happens asynchronously.
+            wait_for_termination: If True, blocks while waiting for subprocess
+                termination. If False, sends SIGTERM but returns immediately
+                without waiting (fire-and-forget).
 
         Returns:
             Number of sessions that were cancelled.
         """
         cancelled = 0
         for s in self._sessions.values():
-            if s.cancel():
+            if s.cancel(wait=wait_for_termination):
                 cancelled += 1
         return cancelled
 
