@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ from plan_finder_gui.engine.throttle import (
     CcusageNotInstalled,
     NoActiveSession,
     SessionThrottle,
+    _parse_ccusage_result,
 )
 
 
@@ -175,3 +178,123 @@ class TestSessionThrottleReinitGracefulDegradation:
         status = throttle.status_line()
         assert "No active session" in status
         assert "throttle disabled" in status
+
+
+def _make_completed_process(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+    """Helper to create a mock CompletedProcess for testing."""
+    return subprocess.CompletedProcess(
+        args=["ccusage", "blocks", "--json", "--active"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr="",
+    )
+
+
+class TestParseCcusageResultMalformedTimeFields:
+    """Tests for _parse_ccusage_result handling of malformed time fields."""
+
+    def test_raises_no_active_session_when_start_time_missing(self):
+        """Should raise NoActiveSession when active block is missing 'startTime' key."""
+        # Valid JSON with active block, but missing startTime field
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": 5.0,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "without required time field" in str(exc_info.value)
+        assert "'startTime'" in str(exc_info.value)
+
+    def test_raises_no_active_session_when_end_time_is_null(self):
+        """Should raise NoActiveSession when endTime is null (None)."""
+        # Valid JSON with active block, but endTime is null
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": None,
+                    "costUSD": 5.0,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "invalid time value" in str(exc_info.value) or "null or wrong type" in str(exc_info.value)
+
+    def test_raises_no_active_session_when_start_time_is_malformed(self):
+        """Should raise NoActiveSession when startTime has malformed date string."""
+        # Valid JSON with active block, but startTime is not a valid ISO format
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "invalid-date",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": 5.0,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "malformed date string" in str(exc_info.value)
+
+    def test_raises_no_active_session_when_end_time_is_malformed(self):
+        """Should raise NoActiveSession when endTime has malformed date string."""
+        # Valid JSON with active block, but endTime is not a valid ISO format
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "not-a-date-123",
+                    "costUSD": 5.0,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "malformed date string" in str(exc_info.value)
+
+    def test_raises_no_active_session_when_start_time_is_wrong_type(self):
+        """Should raise NoActiveSession when startTime is wrong type (e.g., integer)."""
+        # Valid JSON with active block, but startTime is an integer
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": 1715846400,  # Unix timestamp instead of ISO string
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": 5.0,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        # Should be caught by TypeError/AttributeError (int has no .replace method)
+        assert "invalid time value" in str(exc_info.value) or "null or wrong type" in str(exc_info.value)

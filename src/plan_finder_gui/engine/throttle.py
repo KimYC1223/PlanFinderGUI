@@ -64,14 +64,32 @@ def _parse_ccusage_result(json_result: subprocess.CompletedProcess) -> dict:
     if active_block is None:
         raise NoActiveSession("No active session found via ccusage.")
 
-    start_utc = datetime.fromisoformat(
-        active_block["startTime"].replace("Z", "+00:00")
-    )
-    end_utc = datetime.fromisoformat(
-        active_block["endTime"].replace("Z", "+00:00")
-    )
-    session_start = start_utc.astimezone().replace(tzinfo=None)
-    session_end = end_utc.astimezone().replace(tzinfo=None)
+    # Defensive parsing of time fields - ccusage may return unexpected formats
+    try:
+        start_time_raw = active_block["startTime"]
+        end_time_raw = active_block["endTime"]
+        start_utc = datetime.fromisoformat(
+            start_time_raw.replace("Z", "+00:00")
+        )
+        end_utc = datetime.fromisoformat(
+            end_time_raw.replace("Z", "+00:00")
+        )
+        session_start = start_utc.astimezone().replace(tzinfo=None)
+        session_end = end_utc.astimezone().replace(tzinfo=None)
+    except KeyError as e:
+        raise NoActiveSession(
+            f"ccusage returned active block without required time field: {e}"
+        ) from e
+    except (TypeError, AttributeError) as e:
+        # TypeError/AttributeError if startTime or endTime is None or not a string
+        raise NoActiveSession(
+            f"ccusage returned active block with invalid time value (null or wrong type): {e}"
+        ) from e
+    except ValueError as e:
+        # ValueError if the date string is malformed
+        raise NoActiveSession(
+            f"ccusage returned active block with malformed date string: {e}"
+        ) from e
 
     return {
         "session_start": session_start,
