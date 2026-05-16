@@ -11,10 +11,12 @@ live sparkline.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Callable, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -25,6 +27,18 @@ if TYPE_CHECKING:  # pragma: no cover
 CPU_HISTORY_LEN = 60     # seconds shown in the sparkline (1 sample/sec)
 POLL_INTERVAL_MS = 1000  # CPU sampling cadence
 
+# Shared thread pool for background termination work
+_termination_executor: ThreadPoolExecutor | None = None
+
+
+def _get_termination_executor() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool for subprocess termination."""
+    global _termination_executor
+    if _termination_executor is None:
+        # Use a small pool - termination is mostly waiting, not CPU-bound
+        _termination_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="term")
+    return _termination_executor
+
 
 class Session(QObject):
     """One PlanFinder-launched Claude session.
@@ -32,10 +46,19 @@ class Session(QObject):
     The actual coroutine and adapter live elsewhere; this object just carries
     the metadata, owns the per-session CPU history, and exposes Qt signals so
     the UI can subscribe to changes.
+
+    States:
+        - "starting": Session created but not yet running
+        - "running": Session is actively executing
+        - "terminating": Cancellation requested, subprocess cleanup in progress
+        - "completed": Session finished successfully
+        - "cancelled": Session was cancelled by user
+        - "failed": Session encountered an error
     """
 
     cpu_updated = Signal(float)        # latest cpu % (sum across owned PIDs)
-    state_changed = Signal(str)        # "running" / "completed" / "cancelled" / "failed"
+    state_changed = Signal(str)        # "running" / "completed" / "cancelled" / "failed" / "terminating"
+    termination_complete = Signal()    # emitted when async termination finishes
 
     def __init__(
         self,
@@ -57,6 +80,8 @@ class Session(QObject):
         )
         # psutil.Process objects we've claimed for this session, keyed by pid
         self._procs: dict[int, object] = {}
+        # PIDs that are currently being terminated (to prevent duplicate attempts)
+        self._terminating_pids: set[int] = set()
 
     def claim(self, pid: int, proc: object) -> None:
         self._procs[pid] = proc
@@ -106,24 +131,89 @@ class Session(QObject):
         self.cpu_history.append(normalized)
         return normalized
 
-    def cancel(self, wait: bool = True) -> bool:
-        """Cancel the session task and optionally terminate subprocesses.
+    def cancel(self, wait: bool = False) -> bool:
+        """Cancel the session task and terminate subprocesses.
+
+        By default, this method is non-blocking: it cancels the asyncio task,
+        enters the "terminating" state, and schedules subprocess cleanup in a
+        background thread. The UI remains responsive while termination proceeds.
 
         Args:
-            wait: If True, blocks while waiting for subprocess termination.
-                  If False, sends termination signals but returns immediately.
+            wait: If True, blocks while waiting for subprocess termination
+                  (legacy behavior, use sparingly - only for app shutdown).
+                  If False (default), schedules termination asynchronously and
+                  returns immediately.
 
         Returns:
             True if the task was running and was cancelled, False otherwise.
         """
+        if self.state == "terminating":
+            # Already terminating, don't duplicate the work
+            return False
+
         if self.task and not self.task.done():
             self.task.cancel()
+
             if wait:
+                # Blocking termination - only for app close scenarios
                 self.terminate_procs()
             else:
-                self.terminate_procs_nowait()
+                # Non-blocking: enter terminating state and schedule background work
+                self.state = "terminating"
+                self.state_changed.emit("terminating")
+                self._schedule_termination_async()
             return True
         return False
+
+    def _schedule_termination_async(
+        self,
+        timeout: float = 5.0,
+        callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Schedule subprocess termination in a background thread.
+
+        This method returns immediately. The actual termination work happens
+        in a thread pool, and when complete, the termination_complete signal
+        is emitted on the Qt main thread.
+
+        Args:
+            timeout: Maximum seconds to wait for graceful termination per process.
+            callback: Optional callback to invoke after termination completes.
+        """
+        # Capture PIDs to terminate before the thread starts
+        pids_to_terminate = set(self._procs.keys())
+        if not pids_to_terminate:
+            # No processes to terminate, emit completion immediately
+            self.termination_complete.emit()
+            if callback:
+                callback()
+            return
+
+        # Mark these PIDs as being terminated
+        self._terminating_pids.update(pids_to_terminate)
+
+        def do_termination() -> None:
+            try:
+                self.terminate_procs(timeout)
+            except Exception as e:
+                logging.warning(f"Error during async termination: {e}")
+            finally:
+                self._terminating_pids.clear()
+
+        def on_done(future) -> None:
+            # Emit signal on Qt main thread via QTimer.singleShot
+            QTimer.singleShot(0, self.termination_complete.emit)
+            if callback:
+                QTimer.singleShot(0, callback)
+
+        executor = _get_termination_executor()
+        future = executor.submit(do_termination)
+        future.add_done_callback(on_done)
+
+    @property
+    def is_terminating(self) -> bool:
+        """True if this session is currently in the terminating state."""
+        return self.state == "terminating"
 
     def terminate_procs_nowait(self) -> None:
         """Send SIGTERM to all subprocesses without waiting for exit.
@@ -145,17 +235,16 @@ class Session(QObject):
             except psutil.NoSuchProcess:
                 pass
             except psutil.AccessDenied:
-                import logging
                 logging.warning(
                     f"Access denied when terminating PID {proc.pid}; "
                     "may require elevated privileges"
                 )
             except Exception as e:
-                import logging
                 logging.warning(f"Error terminating PID {proc.pid}: {e}")
 
         # Clear process tracking - cleanup will happen via drop_dead() or OS
         self._procs.clear()
+        self._terminating_pids.clear()
 
     async def terminate_procs_async(self, timeout: float = 5.0) -> None:
         """Asynchronously terminate all subprocesses owned by this session.
@@ -174,6 +263,8 @@ class Session(QObject):
         First sends SIGTERM (terminate) to each process and waits up to
         ``timeout`` seconds for graceful exit. Any processes still running
         after the timeout are forcibly killed (SIGKILL).
+
+        This method is safe to call from a background thread.
 
         Args:
             timeout: Maximum seconds to wait for graceful termination.
@@ -197,13 +288,11 @@ class Session(QObject):
                 pass
             except psutil.AccessDenied:
                 # Cannot terminate (elevated privileges required)
-                import logging
                 logging.warning(
                     f"Access denied when terminating PID {proc.pid}; "
                     "may require elevated privileges"
                 )
             except Exception as e:
-                import logging
                 logging.warning(f"Error terminating PID {proc.pid}: {e}")
 
         # Phase 2: Wait for graceful termination
@@ -228,31 +317,37 @@ class Session(QObject):
             except psutil.NoSuchProcess:
                 pass
             except psutil.AccessDenied:
-                import logging
                 logging.warning(
                     f"Access denied when killing PID {proc.pid}; "
                     "process may still be running"
                 )
             except Exception as e:
-                import logging
                 logging.warning(f"Error killing PID {proc.pid}: {e}")
 
         # Clear the process tracking dict
         self._procs.clear()
+        self._terminating_pids.clear()
 
 
 class SessionManager(QObject):
-    """Owns the live Session list and broadcasts CPU samples to the UI."""
+    """Owns the live Session list and broadcasts CPU samples to the UI.
+
+    The manager tracks sessions through their lifecycle including the new
+    "terminating" state where subprocess cleanup is in progress.
+    """
 
     session_registered = Signal(object)     # Session
     session_unregistered = Signal(object)   # Session
     session_state_changed = Signal(object)  # Session
+    all_terminations_complete = Signal()    # Emitted when all pending terminations finish
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._sessions: dict[str, Session] = {}
         self._next_id: int = 0
         self._claimed_pids: set[int] = set()
+        # Track sessions that are currently terminating
+        self._terminating_sessions: set[str] = set()
 
         try:
             import psutil
@@ -306,22 +401,64 @@ class SessionManager(QObject):
     def any_running(self) -> bool:
         return any(s.state == "running" for s in self._sessions.values())
 
-    def cancel_all(self, wait_for_termination: bool = True) -> int:
+    def cancel_all(self, wait_for_termination: bool = False) -> int:
         """Cancel all running sessions and terminate their subprocesses.
+
+        By default, this method is non-blocking: it cancels all asyncio tasks
+        and schedules subprocess cleanup in background threads. The UI remains
+        responsive while termination proceeds.
 
         Args:
             wait_for_termination: If True, blocks while waiting for subprocess
-                termination. If False, sends SIGTERM but returns immediately
-                without waiting (fire-and-forget).
+                termination (legacy behavior, only for app shutdown).
+                If False (default), sends SIGTERM and schedules async cleanup,
+                returning immediately to keep the UI responsive.
 
         Returns:
             Number of sessions that were cancelled.
         """
         cancelled = 0
-        for s in self._sessions.values():
+        sessions_to_cancel = [
+            s for s in self._sessions.values()
+            if s.state == "running"
+        ]
+
+        for s in sessions_to_cancel:
             if s.cancel(wait=wait_for_termination):
                 cancelled += 1
+                if not wait_for_termination:
+                    self._terminating_sessions.add(s.id)
+                    # Connect to the session's termination_complete signal
+                    s.termination_complete.connect(
+                        lambda sid=s.id: self._on_session_termination_complete(sid)
+                    )
         return cancelled
+
+    def _on_session_termination_complete(self, session_id: str) -> None:
+        """Handle completion of a session's async termination."""
+        self._terminating_sessions.discard(session_id)
+        if not self._terminating_sessions:
+            self.all_terminations_complete.emit()
+
+    def any_terminating(self) -> bool:
+        """Return True if any sessions are currently terminating."""
+        return bool(self._terminating_sessions) or any(
+            s.state == "terminating" for s in self._sessions.values()
+        )
+
+    def cancel_all_blocking(self, timeout: float = 10.0) -> int:
+        """Cancel all running sessions with blocking termination.
+
+        This method should only be used during app shutdown when we must
+        ensure all subprocesses are cleaned up before exiting.
+
+        Args:
+            timeout: Maximum seconds to wait for all terminations.
+
+        Returns:
+            Number of sessions that were cancelled.
+        """
+        return self.cancel_all(wait_for_termination=True)
 
     # -- CPU polling ---------------------------------------------------- #
 

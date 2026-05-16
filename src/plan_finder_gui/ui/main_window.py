@@ -760,19 +760,57 @@ class MainWindow(QMainWindow):
     def stop_session(self, wait: bool = False) -> None:
         """Stop all running sessions.
 
+        By default, this method is non-blocking: it returns immediately while
+        subprocess termination proceeds in background threads. The UI shows
+        "Stopping..." status and refreshes when termination completes.
+
         Args:
-            wait: If True, blocks while waiting for subprocess termination.
-                  If False (default), sends SIGTERM but returns immediately
-                  to keep the UI responsive. The delayed unregister() call
-                  in _on_session_task_done will handle final cleanup.
+            wait: If True, blocks while waiting for subprocess termination
+                  (only for app shutdown). If False (default), sends SIGTERM
+                  and returns immediately to keep the UI responsive.
         """
+        # Prevent duplicate stop requests while termination is in progress
+        if self._session_manager.any_terminating():
+            self.log_panel.append_log(
+                "이미 세션 종료가 진행 중입니다...", "warn"
+            )
+            return
+
         cancelled = self._session_manager.cancel_all(wait_for_termination=wait)
         for sess in self._session_manager.list():
             sess.adapter.cancel_pending()
+
         if cancelled:
             self.log_panel.append_log(
-                f"Stop 요청: {cancelled}개 세션 취소 중...", "warn"
+                f"Stop 요청: {cancelled}개 세션 종료 중...", "warn"
             )
+            # Update UI to show terminating state
+            self.config_panel.stop_btn.setEnabled(False)
+            self.config_panel.stop_btn.setText("Stopping...")
+            self.config_panel.stop_btn.setToolTip(
+                "Waiting for subprocess termination..."
+            )
+
+            if not wait:
+                # Connect to be notified when all terminations complete
+                self._session_manager.all_terminations_complete.connect(
+                    self._on_all_terminations_complete
+                )
+
+    def _on_all_terminations_complete(self) -> None:
+        """Handle completion of all session terminations."""
+        try:
+            self._session_manager.all_terminations_complete.disconnect(
+                self._on_all_terminations_complete
+            )
+        except RuntimeError:
+            pass  # Already disconnected
+
+        self.log_panel.append_log("모든 세션 종료 완료", "info")
+        # Reset stop button state
+        self.config_panel.stop_btn.setText("Stop")
+        self.config_panel.stop_btn.setToolTip("")
+        # Button enable state will be updated by _on_session_unregistered
 
     def _spawn_session(
         self,
@@ -1021,7 +1059,10 @@ class MainWindow(QMainWindow):
             # action == "quit" → fall through and tear everything down
 
         self.config_panel.save_settings()
-        self.stop_session()
+        # Use blocking termination during app close to ensure all subprocesses
+        # are properly cleaned up before the app exits. This prevents orphan
+        # processes from lingering after the app is closed.
+        self.stop_session(wait=True)
         sound_player.stop_working_loop()
         if getattr(self, "_tray", None) is not None:
             self._tray.hide()

@@ -41,6 +41,10 @@ _STATE_RUN_SS = (
     "color: #4caf50; font-size: 10px; background: transparent;"
     " padding: 0 4px; border: 1px solid #4caf50; border-radius: 6px;"
 )
+_STATE_TERM_SS = (
+    "color: #ff9800; font-size: 10px; background: transparent;"
+    " padding: 0 4px; border: 1px solid #ff9800; border-radius: 6px;"
+)
 _STATE_DONE_SS = (
     "color: #888; font-size: 10px; background: transparent;"
     " padding: 0 4px; border: 1px solid #555; border-radius: 6px;"
@@ -192,17 +196,26 @@ class _SessionCard(QFrame):
         if state == "running":
             self._state_lbl.setStyleSheet(_STATE_RUN_SS)
             self._stop_btn.setEnabled(True)
+        elif state == "terminating":
+            self._state_lbl.setStyleSheet(_STATE_TERM_SS)
+            self._stop_btn.setEnabled(False)
+            self._stop_btn.setToolTip("종료 진행 중...")
         elif state in ("failed", "cancelled"):
             self._state_lbl.setStyleSheet(_STATE_ERR_SS)
             self._stop_btn.setEnabled(False)
+            self._stop_btn.setToolTip("")
         else:
             self._state_lbl.setStyleSheet(_STATE_DONE_SS)
             self._stop_btn.setEnabled(False)
+            self._stop_btn.setToolTip("")
 
     def _on_stop_clicked(self) -> None:
         if self.session.state == "running":
             sound_player.play("buzz.wav")
-        self.session.cancel()
+            self.session.cancel()
+        elif self.session.state == "terminating":
+            # Already terminating, ignore additional clicks
+            pass
 
 
 class SessionsPanel(QWidget):
