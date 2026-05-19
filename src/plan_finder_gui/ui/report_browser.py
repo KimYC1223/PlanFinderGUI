@@ -9,7 +9,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QFileSystemWatcher,
+    QMetaObject,
+    QObject,
+    QPoint,
+    QRunnable,
+    QSettings,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from . import sound_player
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
@@ -26,6 +40,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -35,6 +50,83 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+# ---------------------------------------------------------------------------
+# Translation worker for background threading
+# ---------------------------------------------------------------------------
+
+
+class TranslationSignals(QObject):
+    """Signals for TranslationWorker to communicate with the main thread.
+
+    Qt signals must be defined on a QObject, not QRunnable directly.
+    """
+    started = Signal(Path)           # Emitted when translation begins for a file
+    finished = Signal(Path, str)     # Emitted on success: (file_path, translated_text)
+    error = Signal(Path, str)        # Emitted on error: (file_path, error_message)
+    progress = Signal(int, int)      # Emitted for batch progress: (current, total)
+
+
+class TranslationWorker(QRunnable):
+    """Background worker for translating files without blocking the UI.
+
+    Runs the synchronous translation functions in a thread pool, emitting
+    signals for thread-safe GUI updates via Qt's queued connections.
+    """
+
+    def __init__(
+        self,
+        file_path: Path,
+        method: str,
+        cancel_flag: list[bool] | None = None,
+    ) -> None:
+        """Initialize the translation worker.
+
+        Args:
+            file_path: Path to the markdown file to translate.
+            method: Translation method - "Google Translate API" or "Claude".
+            cancel_flag: A mutable list [bool] shared with the caller. If
+                cancel_flag[0] becomes True, the worker skips processing.
+        """
+        super().__init__()
+        self.file_path = file_path
+        self.method = method
+        self.cancel_flag = cancel_flag
+        self.signals = TranslationSignals()
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        """Execute the translation in a background thread."""
+        # Check cancellation before starting
+        if self.cancel_flag and self.cancel_flag[0]:
+            return
+
+        self.signals.started.emit(self.file_path)
+
+        try:
+            from ..engine.translator import save_translated, translate_with_claude, translate_with_google
+
+            # Check cancellation again before the expensive network call
+            if self.cancel_flag and self.cancel_flag[0]:
+                return
+
+            content = self.file_path.read_text(encoding="utf-8")
+
+            if "Google" in self.method:
+                translated_text = translate_with_google(content)
+            else:
+                translated_text = translate_with_claude(content)
+
+            # Check cancellation before saving
+            if self.cancel_flag and self.cancel_flag[0]:
+                return
+
+            save_translated(self.file_path, translated_text)
+            self.signals.finished.emit(self.file_path, translated_text)
+
+        except Exception as e:
+            self.signals.error.emit(self.file_path, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +385,14 @@ class ReportBrowser(QWidget):
         self._chat_task: asyncio.Task | None = None
         self._chat_blocks: dict[Path, list[str]] = {}   # per-file HTML block fragments
         self._chat_pending: dict[Path, str | None] = {}  # per-file pending proposed content
+
+        # Translation worker state for cancel coordination
+        self._translation_cancel_flag: list[bool] = [False]  # mutable flag shared with workers
+        self._translation_progress: QProgressDialog | None = None
+        self._translation_pending_files: list[Path] = []  # files remaining in batch
+        self._translation_errors: list[str] = []  # collected errors for batch summary
+        self._translation_success_count: int = 0  # count of successful translations
+        self._translation_method: str = ""  # current batch translation method
 
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_fs_change)
@@ -879,12 +979,12 @@ class ReportBrowser(QWidget):
             self._translate_file(path)
 
     def _translate_file(self, path: Path) -> None:
+        """Translate a single file using a background worker thread.
+
+        Shows a progress dialog that can be cancelled by the user. The UI
+        remains responsive during translation.
+        """
         from PySide6.QtCore import QSettings
-        from PySide6.QtWidgets import (
-            QApplication, QComboBox, QDialog, QDialogButtonBox,
-            QLabel, QMessageBox, QVBoxLayout,
-        )
-        from ..engine.translator import save_translated, translate_with_claude, translate_with_google
 
         settings = QSettings()
         saved_method = str(settings.value("translate_method", "Google Translate API"))
@@ -927,37 +1027,101 @@ class ReportBrowser(QWidget):
             return
 
         method = combo.currentText()
+        settings.setValue("translate_method", method)
 
         if "Google" in method:
             from .google_auth_dialog import GoogleAuthDialog
             if not GoogleAuthDialog.ensure_credentials(self):
                 return
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            content = path.read_text(encoding="utf-8")
-            if "Google" in method:
-                translated_text = translate_with_google(content)
-            else:
-                translated_text = translate_with_claude(content)
-            save_translated(path, translated_text)
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            sound_player.play_random("tscerr00.wav", "tscerr01.wav")
-            QMessageBox.warning(self, "번역 실패", f"번역 중 오류가 발생했습니다:\n{e}")
-            return
-        QApplication.restoreOverrideCursor()
+        # Create a non-modal progress dialog with cancel button
+        progress = QProgressDialog(
+            f"번역 중: {path.name}",
+            "취소",
+            0, 0,  # 0, 0 makes it an indeterminate progress bar
+            self,
+        )
+        progress.setWindowTitle("번역 중...")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)  # Show immediately
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setStyleSheet(
+            "QProgressDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; }"
+            "QPushButton { background: #c62828; color: white; border: none;"
+            "  padding: 6px 16px; border-radius: 3px; }"
+            "QPushButton:hover { background: #d32f2f; }"
+        )
+
+        # Reset cancel flag
+        self._translation_cancel_flag = [False]
+
+        # Connect cancel button to set cancel flag
+        progress.canceled.connect(lambda: self._on_single_translation_cancelled(progress))
+
+        # Create worker
+        worker = TranslationWorker(path, method, self._translation_cancel_flag)
+
+        # Store progress dialog reference to check validity in callbacks
+        self._translation_progress = progress
+
+        # Connect signals with queued connection for thread safety
+        worker.signals.finished.connect(
+            lambda fp, _: self._on_single_translation_finished(fp, progress),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.signals.error.connect(
+            lambda fp, err: self._on_single_translation_error(fp, err, progress),
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        # Submit to thread pool
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_single_translation_cancelled(self, progress: QProgressDialog) -> None:
+        """Handle cancellation of single file translation."""
+        self._translation_cancel_flag[0] = True
+        if progress and not progress.wasCanceled():
+            progress.cancel()
+        self._translation_progress = None
+
+    def _on_single_translation_finished(self, path: Path, progress: QProgressDialog) -> None:
+        """Handle successful completion of single file translation."""
+        # Check if progress dialog is still valid
+        if self._translation_progress is not progress:
+            return  # Widget was closed or a different translation is running
+
+        progress.close()
+        self._translation_progress = None
+
         sound_player.play("trescue.wav")
         if self._current_file == path:
             self._show_file(path)
 
+    def _on_single_translation_error(
+        self, path: Path, error: str, progress: QProgressDialog
+    ) -> None:
+        """Handle error during single file translation."""
+        # Check if progress dialog is still valid
+        if self._translation_progress is not progress:
+            return
+
+        progress.close()
+        self._translation_progress = None
+
+        sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+        QMessageBox.warning(self, "번역 실패", f"번역 중 오류가 발생했습니다:\n{error}")
+
     def _translate_all_files(self, files: list[Path]) -> None:
+        """Translate multiple files using background worker threads.
+
+        Files are processed sequentially (one at a time) to avoid overwhelming
+        the translation APIs. A progress dialog shows the current file and
+        allows cancellation. Errors are collected and shown in a summary at
+        the end.
+        """
         from PySide6.QtCore import QSettings
-        from PySide6.QtWidgets import (
-            QApplication, QComboBox, QDialog, QDialogButtonBox,
-            QLabel, QMessageBox, QVBoxLayout,
-        )
-        from ..engine.translator import save_translated, translate_with_claude, translate_with_google
 
         settings = QSettings()
         saved_method = str(settings.value("translate_method", "Google Translate API"))
@@ -1007,31 +1171,168 @@ class ReportBrowser(QWidget):
             if not GoogleAuthDialog.ensure_credentials(self):
                 return
 
-        errors: list[str] = []
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        for path in files:
-            try:
-                content = path.read_text(encoding="utf-8")
-                if "Google" in method:
-                    translated_text = translate_with_google(content)
-                else:
-                    translated_text = translate_with_claude(content)
-                save_translated(path, translated_text)
-                if self._current_file == path:
-                    self._show_file(path)
-            except Exception as e:
-                errors.append(f"{path.name}: {e}")
-        QApplication.restoreOverrideCursor()
+        # Initialize batch translation state
+        self._translation_cancel_flag = [False]
+        self._translation_pending_files = list(files)  # Copy to avoid mutation issues
+        self._translation_errors = []
+        self._translation_success_count = 0
+        self._translation_method = method
+        total_files = len(files)
 
-        if errors:
+        # Create progress dialog
+        progress = QProgressDialog(
+            f"번역 중: 파일 1 / {total_files}",
+            "취소",
+            0, total_files,
+            self,
+        )
+        progress.setWindowTitle("번역 중...")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setStyleSheet(
+            "QProgressDialog { background: #252526; color: #ccc; }"
+            "QLabel { color: #ccc; }"
+            "QProgressBar { background: #333; border: 1px solid #555;"
+            "  border-radius: 3px; text-align: center; color: #ccc; }"
+            "QProgressBar::chunk { background: #0e639c; }"
+            "QPushButton { background: #c62828; color: white; border: none;"
+            "  padding: 6px 16px; border-radius: 3px; }"
+            "QPushButton:hover { background: #d32f2f; }"
+        )
+
+        self._translation_progress = progress
+
+        # Connect cancel button
+        progress.canceled.connect(self._on_batch_translation_cancelled)
+
+        # Start the first translation
+        self._start_next_batch_translation()
+
+    def _start_next_batch_translation(self) -> None:
+        """Start translation for the next file in the batch queue."""
+        # Check if cancelled or no more files
+        if self._translation_cancel_flag[0] or not self._translation_pending_files:
+            self._finish_batch_translation()
+            return
+
+        # Get the next file
+        path = self._translation_pending_files.pop(0)
+        total = (
+            len(self._translation_pending_files)
+            + self._translation_success_count
+            + len(self._translation_errors)
+            + 1  # current file
+        )
+        current = self._translation_success_count + len(self._translation_errors) + 1
+
+        # Update progress dialog
+        if self._translation_progress and not self._translation_progress.wasCanceled():
+            self._translation_progress.setLabelText(
+                f"번역 중: 파일 {current} / {total}\n{path.name}"
+            )
+            self._translation_progress.setValue(current - 1)
+
+        # Create and start worker
+        worker = TranslationWorker(path, self._translation_method, self._translation_cancel_flag)
+
+        worker.signals.finished.connect(
+            self._on_batch_file_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.signals.error.connect(
+            self._on_batch_file_error,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_batch_file_finished(self, path: Path, translated_text: str) -> None:
+        """Handle successful translation of a file in batch mode."""
+        self._translation_success_count += 1
+
+        # Update viewer if this file is currently displayed
+        if self._current_file == path:
+            self._show_file(path)
+
+        # Continue with next file
+        self._start_next_batch_translation()
+
+    def _on_batch_file_error(self, path: Path, error: str) -> None:
+        """Handle translation error for a file in batch mode."""
+        self._translation_errors.append(f"{path.name}: {error}")
+
+        # Continue with next file (don't stop the batch on individual errors)
+        self._start_next_batch_translation()
+
+    def _on_batch_translation_cancelled(self) -> None:
+        """Handle user cancellation of batch translation."""
+        self._translation_cancel_flag[0] = True
+        # The current worker will check the flag and stop.
+        # _finish_batch_translation will be called when _start_next_batch_translation
+        # sees the cancel flag.
+
+    def _finish_batch_translation(self) -> None:
+        """Complete the batch translation and show summary."""
+        # Close progress dialog
+        if self._translation_progress:
+            self._translation_progress.close()
+            self._translation_progress = None
+
+        errors = self._translation_errors
+        success_count = self._translation_success_count
+        was_cancelled = self._translation_cancel_flag[0]
+        remaining = len(self._translation_pending_files)
+
+        # Reset state
+        self._translation_pending_files = []
+        self._translation_errors = []
+        self._translation_success_count = 0
+
+        # Show summary
+        if was_cancelled and remaining > 0:
+            # User cancelled with files remaining
+            if errors:
+                sound_player.play_random("tscerr00.wav", "tscerr01.wav")
+                QMessageBox.warning(
+                    self,
+                    "번역 취소됨",
+                    f"번역이 취소되었습니다.\n\n"
+                    f"완료: {success_count}개\n"
+                    f"실패: {len(errors)}개\n"
+                    f"취소됨: {remaining}개\n\n"
+                    f"실패한 파일:\n" + "\n".join(errors[:10])
+                    + ("\n..." if len(errors) > 10 else ""),
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "번역 취소됨",
+                    f"번역이 취소되었습니다.\n\n"
+                    f"완료: {success_count}개\n"
+                    f"취소됨: {remaining}개",
+                )
+        elif errors:
+            # Completed with some errors
             sound_player.play_random("tscerr00.wav", "tscerr01.wav")
             QMessageBox.warning(
                 self,
                 "번역 일부 실패",
-                f"다음 파일 번역 중 오류가 발생했습니다:\n\n" + "\n".join(errors),
+                f"번역이 완료되었습니다.\n\n"
+                f"성공: {success_count}개\n"
+                f"실패: {len(errors)}개\n\n"
+                f"실패한 파일:\n" + "\n".join(errors[:10])
+                + ("\n..." if len(errors) > 10 else ""),
             )
-        else:
+        elif success_count > 0:
+            # All successful
             sound_player.play("trescue.wav")
+            QMessageBox.information(
+                self,
+                "번역 완료",
+                f"모든 파일({success_count}개)이 성공적으로 번역되었습니다.",
+            )
 
     # ------------------------------------------------------------------ #
     #  Team distribution                                                   #
