@@ -635,6 +635,10 @@ class ReportBrowser(QWidget):
             cat_dir = self._report_dir / cat
             if cat_dir.is_dir():
                 paths_to_watch.append(str(cat_dir))
+                # Also watch translated/ subdirectory for translation file changes
+                translated_dir = cat_dir / "translated"
+                if translated_dir.is_dir():
+                    paths_to_watch.append(str(translated_dir))
         self._fs_watcher.addPaths(paths_to_watch)
 
     def _on_fs_change(self, _path: str) -> None:
@@ -1336,6 +1340,9 @@ class ReportBrowser(QWidget):
                 "번역 완료",
                 f"모든 파일({success_count}개)이 성공적으로 번역되었습니다.",
             )
+
+        # Refresh UI to reflect newly translated files
+        self.refresh()
 
     # ------------------------------------------------------------------ #
     #  Team distribution                                                   #
