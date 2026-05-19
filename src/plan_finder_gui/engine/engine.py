@@ -64,8 +64,14 @@ def _quiet_hours_enabled() -> bool:
 
 
 async def _wait_if_quiet_hours(display: DisplayInterface) -> None:
-    """Sleep until quiet hours (22:00~03:00) are over (when enabled)."""
+    """Sleep until quiet hours (22:00~03:00) are over (when enabled).
+
+    Polls every 60 seconds to allow early wake-up if the user disables
+    the quiet hours setting via the Options menu.
+    """
     from datetime import datetime, timedelta
+
+    POLL_INTERVAL = 60  # seconds
 
     if not _quiet_hours_enabled():
         return
@@ -83,8 +89,30 @@ async def _wait_if_quiet_hours(display: DisplayInterface) -> None:
             f"Sleeping until {wake.strftime('%H:%M')} "
             f"({wait_secs / 60:.0f} min)..."
         )
-        await asyncio.sleep(wait_secs)
-        display.log("Quiet hours over, resuming...")
+
+        # Poll in short increments to detect setting changes mid-sleep
+        while True:
+            # Check if quiet hours setting was disabled by the user
+            if not _quiet_hours_enabled():
+                display.log("Quiet hours setting disabled mid-sleep. Resuming immediately...")
+                return
+
+            # Re-check if we're still within quiet hours window (handles clock changes)
+            now = datetime.now()
+            hour = now.hour
+            if not (hour >= QUIET_START or hour < QUIET_END):
+                display.log("Quiet hours over, resuming...")
+                return
+
+            # Calculate remaining time until scheduled wake
+            remaining = (wake - now).total_seconds()
+            if remaining <= 0:
+                display.log("Quiet hours over, resuming...")
+                return
+
+            # Sleep for the shorter of POLL_INTERVAL or remaining time
+            sleep_time = min(POLL_INTERVAL, remaining)
+            await asyncio.sleep(sleep_time)
 
 
 def _extract_resets_at(err_msg: str) -> float | None:
