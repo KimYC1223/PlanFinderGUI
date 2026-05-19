@@ -19,23 +19,29 @@ class ExistingPlanSummary:
     status: str
     keyword: str
     title: str
+    timestamp_str: str  # YYYYMMDD_HHMMSS format for sorting by recency
 
 
-def _parse_plan_filename(stem: str) -> tuple[str, str]:
-    """Recover (keyword, title) from a plan file stem.
+def _parse_plan_filename(stem: str) -> tuple[str, str, str]:
+    """Recover (keyword, title, timestamp_str) from a plan file stem.
 
     Save format is `<Keyword>__<YYYYMMDD>_<HHMMSS>_<safe-title>`.
-    Falls back to ("Unassigned", stem) when the pattern doesn't match.
+    Falls back to ("Unassigned", stem, "") when the pattern doesn't match.
+    The timestamp_str is in YYYYMMDD_HHMMSS format for lexicographic sorting.
     """
     if "__" in stem:
         keyword, rest = stem.split("__", 1)
         parts = rest.split("_", 2)
         if len(parts) >= 3:
+            # parts[0] = YYYYMMDD, parts[1] = HHMMSS, parts[2] = safe-title
+            timestamp_str = f"{parts[0]}_{parts[1]}"
             title = parts[2].replace("-", " ").strip() or stem
         else:
+            # Malformed: no timestamp found
+            timestamp_str = ""
             title = rest.replace("-", " ")
-        return keyword or "Unassigned", title
-    return "Unassigned", stem.replace("-", " ")
+        return keyword or "Unassigned", title, timestamp_str
+    return "Unassigned", stem.replace("-", " "), ""
 
 
 def _is_translated_stem(stem: str) -> bool:
@@ -74,8 +80,13 @@ def scan_existing_plans(report_dir: Path) -> list[ExistingPlanSummary]:
             try:
                 if _is_translated_stem(f.stem):
                     continue
-                keyword, title = _parse_plan_filename(f.stem)
-                out.append(ExistingPlanSummary(status=status, keyword=keyword, title=title))
+                keyword, title, timestamp_str = _parse_plan_filename(f.stem)
+                out.append(ExistingPlanSummary(
+                    status=status,
+                    keyword=keyword,
+                    title=title,
+                    timestamp_str=timestamp_str,
+                ))
             except Exception as e:
                 # Skip files that fail to parse, logging a warning
                 logger.warning(

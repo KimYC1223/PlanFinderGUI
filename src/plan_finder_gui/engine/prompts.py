@@ -69,7 +69,11 @@ def build_prompt(
         rejection_text = ""
 
     if existing_plans:
-        recent = existing_plans[-MAX_EXISTING_IN_PROMPT:]
+        # Sort by timestamp (ascending) so most recent plans are at the end,
+        # then truncate to keep the most recent ones. Plans without a valid
+        # timestamp (empty string) sort first and may be dropped if over limit.
+        sorted_plans = sorted(existing_plans, key=lambda p: p.timestamp_str)
+        recent = sorted_plans[-MAX_EXISTING_IN_PROMPT:]
         lines = []
         if len(existing_plans) > MAX_EXISTING_IN_PROMPT:
             lines.append(

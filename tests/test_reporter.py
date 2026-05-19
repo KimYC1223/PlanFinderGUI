@@ -19,20 +19,29 @@ class TestParseFilename:
 
     def test_standard_format(self):
         """Test parsing a standard plan filename."""
-        keyword, title = _parse_plan_filename("TestKeyword__20260509_143000_test-plan-title")
+        keyword, title, timestamp_str = _parse_plan_filename("TestKeyword__20260509_143000_test-plan-title")
         assert keyword == "TestKeyword"
         assert title == "test plan title"
+        assert timestamp_str == "20260509_143000"
 
     def test_missing_keyword(self):
         """Test parsing filename without keyword prefix."""
-        keyword, title = _parse_plan_filename("some-plan-name")
+        keyword, title, timestamp_str = _parse_plan_filename("some-plan-name")
         assert keyword == "Unassigned"
         assert title == "some plan name"
+        assert timestamp_str == ""
 
     def test_empty_keyword(self):
         """Test parsing filename with empty keyword."""
-        keyword, title = _parse_plan_filename("__20260509_143000_test-title")
+        keyword, title, timestamp_str = _parse_plan_filename("__20260509_143000_test-title")
         assert keyword == "Unassigned"
+        assert timestamp_str == "20260509_143000"
+
+    def test_malformed_timestamp(self):
+        """Test parsing filename with malformed timestamp portion."""
+        keyword, title, timestamp_str = _parse_plan_filename("Feature__incomplete")
+        assert keyword == "Feature"
+        assert timestamp_str == ""  # Malformed, no valid timestamp
 
 
 class TestScanExistingPlans:
@@ -68,6 +77,11 @@ class TestScanExistingPlans:
 
         keywords = {p.keyword for p in plans}
         assert keywords == {"Feature", "BugFix", "Refactor"}
+
+        # Verify timestamp_str is populated
+        for plan in plans:
+            assert plan.timestamp_str != ""
+            assert "_" in plan.timestamp_str  # Format: YYYYMMDD_HHMMSS
 
     def test_scan_handles_missing_directories(self, tmp_path: Path):
         """Test that scan handles missing status directories gracefully."""
