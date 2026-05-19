@@ -613,6 +613,7 @@ class ReportBrowser(QWidget):
     # ------------------------------------------------------------------ #
 
     def set_report_dir(self, path: Path) -> None:
+        self._cancel_chat_task()
         self._report_dir = path
         self._reset_watcher()
         self._deselect_file()
@@ -1682,8 +1683,15 @@ class ReportBrowser(QWidget):
             self._chat_history.setVisible(False)
         self._chat_apply_bar.setVisible(pending is not None)
 
+    def _cancel_chat_task(self) -> None:
+        """Cancel any in-progress chat task to prevent stale callbacks."""
+        if self._chat_task is not None and not self._chat_task.done():
+            self._chat_task.cancel()
+            self._chat_task = None
+
     def _unload_chat_ui(self) -> None:
         """Reset chat UI to empty state without touching per-file state dicts."""
+        self._cancel_chat_task()
         self._chat_history.setHtml("")
         self._chat_history.setVisible(False)
         self._chat_apply_bar.setVisible(False)
@@ -1714,6 +1722,9 @@ class ReportBrowser(QWidget):
 
     def _on_chat_task_done(self, task: asyncio.Task) -> None:
         self._chat_task = None
+        # Guard against stale callbacks after project switch or widget destruction
+        if self._report_dir is None or not self.isVisible():
+            return
         if not task.cancelled() and task.exception() is not None:
             self._append_chat_msg("error", f"오류: {task.exception()}")
 
@@ -1805,6 +1816,11 @@ class ReportBrowser(QWidget):
             self._show_file(self._current_file)
         except Exception as e:
             QMessageBox.warning(self, "저장 실패", f"파일 저장 실패: {e}")
+
+    def closeEvent(self, event) -> None:
+        """Clean up resources when the widget is closed."""
+        self._cancel_chat_task()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
