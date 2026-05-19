@@ -88,6 +88,9 @@ class MainWindow(QMainWindow):
         self._session_manager.session_registered.connect(self._on_session_registered)
         self._session_manager.session_unregistered.connect(self._on_session_unregistered)
 
+        # Restore window geometry and splitter positions from previous session
+        self._restore_window_state()
+
     def _build_menu(self) -> None:
         bar = self.menuBar()
         bar.setStyleSheet(
@@ -1031,6 +1034,72 @@ class MainWindow(QMainWindow):
         self.close()
 
     # ------------------------------------------------------------------ #
+    #  Window state persistence                                            #
+    # ------------------------------------------------------------------ #
+
+    def _restore_window_state(self) -> None:
+        """Restore window geometry and splitter positions from QSettings.
+
+        Validates that the restored position is on a visible screen to handle
+        multi-monitor setups where a monitor may have been disconnected.
+        Falls back to sensible defaults if restoration fails or data is corrupted.
+        """
+        s = QSettings()
+
+        try:
+            # Restore main window geometry (position and size)
+            geometry = s.value("mainwindow/geometry")
+            if geometry:
+                restored = self.restoreGeometry(geometry)
+                if restored:
+                    # Validate window is on a visible screen
+                    window_center = self.geometry().center()
+                    screen = QGuiApplication.screenAt(window_center)
+                    if screen is None:
+                        # Window is off-screen (e.g., monitor disconnected)
+                        # Move to primary screen with sensible defaults
+                        self._reset_to_default_geometry()
+
+            # Restore main window state (toolbar positions, etc.)
+            state = s.value("mainwindow/state")
+            if state:
+                self.restoreState(state)
+
+            # Restore main splitter (left panel | right content)
+            main_splitter_state = s.value("mainwindow/main_splitter")
+            if main_splitter_state:
+                self._main_splitter.restoreState(main_splitter_state)
+
+            # Restore right splitter (browser | log)
+            right_splitter_state = s.value("mainwindow/right_splitter")
+            if right_splitter_state:
+                self._right_splitter.restoreState(right_splitter_state)
+
+        except Exception:
+            # Corrupted QSettings data — reset to defaults
+            self._reset_to_default_geometry()
+            self._main_splitter.setSizes([320, 980])
+            self._right_splitter.setSizes([580, 220])
+
+    def _reset_to_default_geometry(self) -> None:
+        """Reset window to default size and center on primary screen."""
+        self.resize(1300, 850)
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            screen_geometry = screen.availableGeometry()
+            x = (screen_geometry.width() - self.width()) // 2 + screen_geometry.x()
+            y = (screen_geometry.height() - self.height()) // 2 + screen_geometry.y()
+            self.move(x, y)
+
+    def _save_window_state(self) -> None:
+        """Persist window geometry and splitter positions to QSettings."""
+        s = QSettings()
+        s.setValue("mainwindow/geometry", self.saveGeometry())
+        s.setValue("mainwindow/state", self.saveState())
+        s.setValue("mainwindow/main_splitter", self._main_splitter.saveState())
+        s.setValue("mainwindow/right_splitter", self._right_splitter.saveState())
+
+    # ------------------------------------------------------------------ #
     #  Close handling                                                      #
     # ------------------------------------------------------------------ #
 
@@ -1059,6 +1128,7 @@ class MainWindow(QMainWindow):
             # action == "quit" → fall through and tear everything down
 
         self.config_panel.save_settings()
+        self._save_window_state()
         # Use blocking termination during app close to ensure all subprocesses
         # are properly cleaned up before the app exits. This prevents orphan
         # processes from lingering after the app is closed.
