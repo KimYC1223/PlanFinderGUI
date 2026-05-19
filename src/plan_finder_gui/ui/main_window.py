@@ -643,6 +643,25 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def _ensure_claude_cli(self) -> bool:
+        """Validate that the Claude CLI is installed and executable.
+
+        Called from every entry point that spawns a Claude session (Start /
+        Resolve / Restart) so CLI issues are caught immediately rather than
+        after session initialization.
+        """
+        from ..engine.executor import validate_claude_cli
+
+        success, message = validate_claude_cli()
+        if not success:
+            QMessageBox.warning(
+                self,
+                "Claude CLI를 찾을 수 없습니다",
+                message,
+            )
+            return False
+        return True
+
     def start_session(self) -> None:
         from ..engine.executor import _show_error
         try:
@@ -658,6 +677,8 @@ class MainWindow(QMainWindow):
         config = self.config_panel.get_config()
 
         if not self._ensure_project_access(config["project_dir"]):
+            return
+        if not self._ensure_claude_cli():
             return
         if not config["prompt"]:
             self._warn("Missing Input", "Please enter a prompt.")
@@ -1389,6 +1410,8 @@ class MainWindow(QMainWindow):
         config = self.config_panel.get_config()
         if not self._ensure_project_access(config["project_dir"]):
             return
+        if not self._ensure_claude_cli():
+            return
 
         report_dir = self._get_report_dir()
         working_dir = report_dir / "working"
@@ -1652,6 +1675,8 @@ class MainWindow(QMainWindow):
 
         config = self.config_panel.get_config()
         if not self._ensure_project_access(config["project_dir"]):
+            return
+        if not self._ensure_claude_cli():
             return
 
         try:

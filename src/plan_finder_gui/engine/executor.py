@@ -455,6 +455,85 @@ def _resolve_cli_path() -> str | None:
         return None
 
 
+def validate_claude_cli(path: str | None = None) -> tuple[bool, str]:
+    """Validate that the Claude CLI is installed and executable.
+
+    Args:
+        path: Optional explicit CLI path. If None, uses _resolve_cli_path()
+              to determine the path, falling back to shutil.which('claude').
+
+    Returns:
+        (success, message) where success is True if the CLI is valid and
+        executable, False otherwise. message contains version info on success
+        or an error description on failure.
+    """
+    try:
+        # Resolve the CLI path
+        if path is None:
+            resolved = _resolve_cli_path()
+            if resolved is None:
+                # _resolve_cli_path returns None when 'claude' is on PATH
+                resolved = shutil.which("claude")
+        else:
+            resolved = path
+
+        if not resolved:
+            return False, (
+                "Claude CLI를 찾을 수 없습니다.\n\n"
+                "다음 방법 중 하나로 설치해 주세요:\n"
+                "• npm install -g @anthropic-ai/claude-code\n"
+                "• 환경설정에서 Claude CLI 경로를 직접 지정"
+            )
+
+        # Verify the path exists (for explicitly configured paths)
+        if not Path(resolved).exists():
+            return False, (
+                f"설정된 Claude CLI 경로가 존재하지 않습니다:\n{resolved}\n\n"
+                "환경설정에서 올바른 경로를 지정하거나, "
+                "경로를 비워두면 자동으로 탐색합니다."
+            )
+
+        # Try to run --version to verify it's executable
+        result = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if result.returncode == 0:
+            version = result.stdout.strip() or result.stderr.strip()
+            return True, f"Claude CLI: {version}" if version else "Claude CLI: OK"
+        else:
+            stderr = result.stderr.strip()
+            return False, (
+                f"Claude CLI 실행 오류 (종료 코드 {result.returncode}):\n"
+                f"{stderr or '(출력 없음)'}\n\n"
+                "터미널에서 `claude --version` 을 직접 실행하여 확인하세요."
+            )
+
+    except subprocess.TimeoutExpired:
+        return False, (
+            "Claude CLI 응답 시간 초과 (5초).\n\n"
+            "터미널에서 `claude --version` 을 직접 실행하여 확인하세요."
+        )
+    except FileNotFoundError:
+        return False, (
+            "Claude CLI를 실행할 수 없습니다.\n\n"
+            "다음 방법 중 하나로 설치해 주세요:\n"
+            "• npm install -g @anthropic-ai/claude-code\n"
+            "• 환경설정에서 Claude CLI 경로를 직접 지정"
+        )
+    except PermissionError:
+        return False, (
+            "Claude CLI 실행 권한이 없습니다.\n\n"
+            "파일 권한을 확인하거나, 터미널에서 "
+            "`chmod +x <path>` 로 실행 권한을 부여하세요."
+        )
+    except Exception as e:
+        return False, f"Claude CLI 검증 중 오류 발생: {e}"
+
+
 def _build_claude_options(cwd: str, model: str | None, max_turns: int):
     from claude_agent_sdk import ClaudeAgentOptions
 
