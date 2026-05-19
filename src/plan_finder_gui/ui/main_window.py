@@ -1315,6 +1315,68 @@ class MainWindow(QMainWindow):
 
         return success_count, failed
 
+    def _execute_transactional_moves(
+        self,
+        moves: list[tuple[Path, Path]],
+        operation_name: str = "move",
+    ) -> tuple[bool, list[Path], list[tuple[Path, Path]]]:
+        """
+        Execute file moves transactionally with rollback on failure.
+
+        This method ensures that either all moves succeed or all completed moves
+        are rolled back to their original locations, preventing orphaned files
+        and partial batch states.
+
+        Args:
+            moves: List of (source, dest) tuples representing files to move.
+            operation_name: Name of the operation for error messages (e.g., "reject", "restore").
+
+        Returns:
+            A tuple of:
+            - success: True if all moves completed, False if rollback occurred
+            - moved_main_files: List of destination paths for main files (not translations)
+            - completed_moves: List of (src, dest) tuples that were completed
+                (useful for additional rollback if a later phase fails)
+        """
+        from ..engine.executor import _show_error
+
+        if not moves:
+            return True, [], []
+
+        completed_moves: list[tuple[Path, Path]] = []
+        moved_main_files: list[Path] = []
+
+        try:
+            for src, dest in moves:
+                # Ensure destination directory exists
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dest)
+                completed_moves.append((src, dest))
+                # Track main files (not translations) for callers
+                if not _is_translated_md(dest):
+                    moved_main_files.append(dest)
+
+            return True, moved_main_files, completed_moves
+
+        except Exception as e:
+            # Rollback all completed moves
+            success_count, failed_files = self._rollback_moves(completed_moves)
+
+            if failed_files:
+                rollback_msg = (
+                    f"파일 {operation_name} 작업 중 오류가 발생했습니다.\n"
+                    f"롤백 부분 실패: {len(failed_files)}개 파일이 대상 위치에 남아있습니다.\n"
+                    f"수동 확인이 필요합니다: {', '.join(failed_files)}"
+                )
+            else:
+                rollback_msg = (
+                    f"파일 {operation_name} 작업 중 오류가 발생했습니다.\n"
+                    f"모든 파일이 원래 위치로 롤백되었습니다."
+                )
+
+            _show_error(f"{operation_name} 실패", rollback_msg, e)
+            return False, [], []
+
     def _on_resolve_requested(self, paths: list) -> None:
         """Move pending files to working/, then start a resolve session.
 
@@ -1431,37 +1493,39 @@ class MainWindow(QMainWindow):
             self.report_browser.refresh()
 
     def _on_reject_requested(self, paths: list) -> None:
-        """Move pending files to reject/."""
+        """Move pending files to reject/ with transactional semantics.
+
+        Uses the same collect-then-execute-with-rollback pattern as
+        _on_resolve_requested to ensure atomic batch operations. If any
+        file move fails, all completed moves are rolled back to prevent
+        orphaned translations or partial batch states.
+        """
         report_dir = self._get_report_dir()
         reject_dir = report_dir / "reject"
-        reject_dir.mkdir(parents=True, exist_ok=True)
+        reject_trans_dir = reject_dir / "translated"
 
+        # Phase 1: Collect all (src, dest) pairs without executing moves
+        pending_moves: list[tuple[Path, Path]] = []
         for p in paths:
             orig = Path(p)
             if not orig.exists():
                 continue
 
-            # Find translation before moving main file (uses orig.parent for lookup)
+            # Queue main file move
+            pending_moves.append((orig, reject_dir / orig.name))
+
+            # Queue translation file move if exists
             trans = _find_translated_helper(orig)
-
-            try:
-                orig.rename(reject_dir / orig.name)
-            except OSError as e:
-                self.log_panel.append_log(
-                    f"Failed to reject {orig.name}: {e}", "warn"
-                )
-                continue
-
-            # Move translation to reject/translated/ subdirectory
             if trans and trans.exists():
-                try:
-                    reject_trans_dir = reject_dir / "translated"
-                    reject_trans_dir.mkdir(parents=True, exist_ok=True)
-                    trans.rename(reject_trans_dir / trans.name)
-                except OSError as e:
-                    self.log_panel.append_log(
-                        f"Failed to move translation {trans.name}: {e}", "warn"
-                    )
+                pending_moves.append((trans, reject_trans_dir / trans.name))
+
+        if not pending_moves:
+            return
+
+        # Phase 2: Execute moves transactionally with rollback on failure
+        success, _, _ = self._execute_transactional_moves(
+            pending_moves, operation_name="reject"
+        )
 
         self.report_browser.refresh()
 
@@ -1620,36 +1684,38 @@ class MainWindow(QMainWindow):
             )
 
     def _on_restore_requested(self, paths: list) -> None:
-        """Move rejected files back to pending/."""
+        """Move rejected files back to pending/ with transactional semantics.
+
+        Uses the same collect-then-execute-with-rollback pattern as
+        _on_resolve_requested to ensure atomic batch operations. If any
+        file move fails, all completed moves are rolled back to prevent
+        orphaned translations or partial batch states.
+        """
         report_dir = self._get_report_dir()
         pending_dir = report_dir / "pending"
-        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_trans_dir = pending_dir / "translated"
 
+        # Phase 1: Collect all (src, dest) pairs without executing moves
+        pending_moves: list[tuple[Path, Path]] = []
         for p in paths:
             orig = Path(p)
             if not orig.exists():
                 continue
 
-            # Find translation before moving main file (uses orig.parent for lookup)
+            # Queue main file move
+            pending_moves.append((orig, pending_dir / orig.name))
+
+            # Queue translation file move if exists
             trans = _find_translated_helper(orig)
-
-            try:
-                orig.rename(pending_dir / orig.name)
-            except OSError as e:
-                self.log_panel.append_log(
-                    f"Failed to restore {orig.name}: {e}", "warn"
-                )
-                continue
-
-            # Move translation to pending/translated/ subdirectory
             if trans and trans.exists():
-                try:
-                    pending_trans_dir = pending_dir / "translated"
-                    pending_trans_dir.mkdir(parents=True, exist_ok=True)
-                    trans.rename(pending_trans_dir / trans.name)
-                except OSError as e:
-                    self.log_panel.append_log(
-                        f"Failed to move translation {trans.name}: {e}", "warn"
-                    )
+                pending_moves.append((trans, pending_trans_dir / trans.name))
+
+        if not pending_moves:
+            return
+
+        # Phase 2: Execute moves transactionally with rollback on failure
+        success, _, _ = self._execute_transactional_moves(
+            pending_moves, operation_name="restore"
+        )
 
         self.report_browser.refresh()
