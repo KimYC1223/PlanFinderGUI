@@ -5,6 +5,7 @@ import glob
 import logging
 import os
 import shutil
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -61,6 +62,83 @@ class _StderrBuffer:
 
 
 _logger = logging.getLogger(__name__)
+
+
+def _capture_git_status(cwd: str) -> dict[str, str]:
+    """Capture current git status as a dict mapping file path to status code.
+
+    Status codes follow git status --porcelain format:
+    - ' M' = modified (not staged)
+    - 'M ' = modified (staged)
+    - 'MM' = modified (staged and unstaged changes)
+    - 'A ' = added (staged)
+    - '??' = untracked
+    - ' D' = deleted (not staged)
+    - 'D ' = deleted (staged)
+    - etc.
+
+    Returns an empty dict if git command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+
+        status: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if len(line) >= 3:
+                code = line[:2]
+                # Handle renamed files: "R  old -> new"
+                path_part = line[3:]
+                if " -> " in path_part and code.startswith("R"):
+                    # For renames, track the new file path
+                    _, new_path = path_part.split(" -> ", 1)
+                    status[new_path] = code
+                else:
+                    status[path_part] = code
+        return status
+    except Exception:
+        return {}
+
+
+def _compute_modified_files(
+    before: dict[str, str], after: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """Compute which files were modified by Claude between two git status snapshots.
+
+    Returns:
+        (modified_files, unrelated_changes)
+        - modified_files: Files that changed (were added/modified/deleted) during the session
+        - unrelated_changes: Files that were already dirty before the session and remain dirty
+    """
+    modified_files: list[str] = []
+    unrelated_changes: list[str] = []
+
+    # Files that are in 'after' but not in 'before', or have different status
+    for path, after_code in after.items():
+        before_code = before.get(path)
+        if before_code is None:
+            # New change - file wasn't dirty before
+            modified_files.append(path)
+        elif before_code != after_code:
+            # Status changed - this could mean Claude modified an already-dirty file
+            # We consider this a Claude modification
+            modified_files.append(path)
+        else:
+            # Same status as before - this is an unrelated change
+            unrelated_changes.append(path)
+
+    # Files that were in 'before' but not in 'after' - these were cleaned up
+    # (e.g., user had untracked file that was deleted, or a modified file that was reset)
+    # We don't track these as they no longer need to be committed
+
+    return modified_files, unrelated_changes
 
 
 def _move_to_reviewed(plan_path: Path) -> Path:
@@ -195,10 +273,29 @@ def _is_batch_resolve_enabled() -> bool:
         return False
 
 
-async def _maybe_auto_commit(plan_path: Path, cwd: str, display) -> None:
+async def _maybe_auto_commit(
+    plan_path: Path,
+    cwd: str,
+    display,
+    modified_files: list[str] | None = None,
+    unrelated_changes: list[str] | None = None,
+) -> None:
     try:
         if not _is_auto_commit_enabled():
             display.log("자동 커밋: 비활성화 상태 (환경설정에서 켤 수 있음)")
+            return
+
+        # Warn about unrelated changes that won't be committed
+        if unrelated_changes:
+            display.log(
+                f"자동 커밋: {len(unrelated_changes)}개 파일의 기존 변경사항은 "
+                f"커밋에 포함되지 않음: {', '.join(unrelated_changes[:5])}"
+                + (f" 외 {len(unrelated_changes) - 5}개" if len(unrelated_changes) > 5 else "")
+            )
+
+        # If no files were modified by Claude, skip commit
+        if modified_files is not None and not modified_files:
+            display.log("자동 커밋: Claude가 수정한 파일 없음, 건너뜀")
             return
 
         lang = _get_work_lang()
@@ -224,9 +321,14 @@ async def _maybe_auto_commit(plan_path: Path, cwd: str, display) -> None:
             commit_msg = title
         display.log(f"커밋 메시지: {commit_msg}")
 
-        display.log("git add + commit 실행 중...")
+        if modified_files:
+            display.log(f"git add ({len(modified_files)}개 파일) + commit 실행 중...")
+        else:
+            display.log("git add + commit 실행 중...")
         loop = asyncio.get_event_loop()
-        success, output = await loop.run_in_executor(None, git_commit, cwd, commit_msg)
+        success, output = await loop.run_in_executor(
+            None, git_commit, cwd, commit_msg, modified_files
+        )
         if success:
             display.log(f"커밋 완료: {commit_msg}")
         else:
@@ -239,10 +341,29 @@ async def _maybe_auto_commit(plan_path: Path, cwd: str, display) -> None:
         )
 
 
-async def _maybe_auto_commit_batch(plan_paths: list[Path], cwd: str, display) -> None:
+async def _maybe_auto_commit_batch(
+    plan_paths: list[Path],
+    cwd: str,
+    display,
+    modified_files: list[str] | None = None,
+    unrelated_changes: list[str] | None = None,
+) -> None:
     try:
         if not _is_auto_commit_enabled():
             display.log("자동 커밋: 비활성화 상태 (환경설정에서 켤 수 있음)")
+            return
+
+        # Warn about unrelated changes that won't be committed
+        if unrelated_changes:
+            display.log(
+                f"자동 커밋: {len(unrelated_changes)}개 파일의 기존 변경사항은 "
+                f"커밋에 포함되지 않음: {', '.join(unrelated_changes[:5])}"
+                + (f" 외 {len(unrelated_changes) - 5}개" if len(unrelated_changes) > 5 else "")
+            )
+
+        # If no files were modified by Claude, skip commit
+        if modified_files is not None and not modified_files:
+            display.log("자동 커밋: Claude가 수정한 파일 없음, 건너뜀")
             return
 
         lang = _get_work_lang()
@@ -277,9 +398,14 @@ async def _maybe_auto_commit_batch(plan_paths: list[Path], cwd: str, display) ->
             commit_msg = "\n\n".join(f"- {t}" for t in titles)
         display.log(f"커밋 메시지: {commit_msg}")
 
-        display.log("git add + commit 실행 중...")
+        if modified_files:
+            display.log(f"git add ({len(modified_files)}개 파일) + commit 실행 중...")
+        else:
+            display.log("git add + commit 실행 중...")
         loop = asyncio.get_event_loop()
-        success, output = await loop.run_in_executor(None, git_commit, cwd, commit_msg)
+        success, output = await loop.run_in_executor(
+            None, git_commit, cwd, commit_msg, modified_files
+        )
         if success:
             display.log(f"커밋 완료: {commit_msg}")
         else:
@@ -431,6 +557,9 @@ async def run_resolve_session(
 
         display.log(f"Resolving: {plan_path.name}")
 
+        # Capture git status before the resolve session
+        status_before = _capture_git_status(cwd)
+
         last_result_subtype: str | None = None
         try:
             from .tool_summary import summarize_tool
@@ -451,7 +580,14 @@ async def run_resolve_session(
                         except Exception:
                             continue
                         display.log(f"Resolved: {plan_path.name}")
-                        await _maybe_auto_commit(plan_path, cwd, display)
+                        # Capture git status after the resolve session
+                        status_after = _capture_git_status(cwd)
+                        modified_files, unrelated_changes = _compute_modified_files(
+                            status_before, status_after
+                        )
+                        await _maybe_auto_commit(
+                            plan_path, cwd, display, modified_files, unrelated_changes
+                        )
                     else:
                         display.on_error(f"Failed to resolve: {plan_path.name}")
         except asyncio.CancelledError:
@@ -549,6 +685,9 @@ async def _run_resolve_session_batched(
     names = ", ".join(p.name for p, _ in valid)
     display.log(f"Resolving (일괄, {len(valid)}개): {names}")
 
+    # Capture git status before the resolve session
+    status_before = _capture_git_status(cwd)
+
     last_result_subtype: str | None = None
     try:
         from .tool_summary import summarize_tool
@@ -574,7 +713,14 @@ async def _run_resolve_session_batched(
                         display.log(
                             f"Resolved (일괄): {', '.join(p.name for p in moved)}"
                         )
-                        await _maybe_auto_commit_batch(moved, cwd, display)
+                        # Capture git status after the resolve session
+                        status_after = _capture_git_status(cwd)
+                        modified_files, unrelated_changes = _compute_modified_files(
+                            status_before, status_after
+                        )
+                        await _maybe_auto_commit_batch(
+                            moved, cwd, display, modified_files, unrelated_changes
+                        )
                 else:
                     display.on_error(
                         f"Failed to resolve batch ({len(valid)} plans): {names}"

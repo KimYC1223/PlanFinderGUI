@@ -226,15 +226,22 @@ async def generate_batch_commit_message(
     return await _generate_via_cli(prompt, cwd)
 
 
-def _unstage_changes(cwd: str, timeout: float = 10.0) -> bool:
-    """Unstage all staged changes via `git reset HEAD`.
+def _unstage_changes(cwd: str, files: list[str] | None = None, timeout: float = 10.0) -> bool:
+    """Unstage changes via `git reset HEAD`.
+
+    If `files` is provided, only those specific files are unstaged.
+    Otherwise, all staged changes are unstaged.
 
     Returns True if unstaging succeeded, False otherwise.
     Uses a timeout to avoid hanging on corrupted repos.
     """
     try:
+        if files:
+            cmd = ["git", "reset", "HEAD", "--"] + files
+        else:
+            cmd = ["git", "reset", "HEAD"]
         reset_result = subprocess.run(
-            ["git", "reset", "HEAD"],
+            cmd,
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -245,22 +252,42 @@ def _unstage_changes(cwd: str, timeout: float = 10.0) -> bool:
         return False
 
 
-def git_commit(cwd: str, message: str) -> tuple[bool, str]:
-    """Stage all changes and create a git commit. Returns (success, output).
+def git_commit(
+    cwd: str, message: str, files: list[str] | None = None
+) -> tuple[bool, str]:
+    """Stage changes and create a git commit. Returns (success, output).
+
+    If `files` is provided, only those specific files are staged using
+    `git add <file>...`. Otherwise, all changes are staged using `git add -A`.
 
     If the commit fails after staging, attempts to unstage the changes
     to leave the repository in a clean state.
     """
     staged_by_us = False
     try:
-        add_result = subprocess.run(
-            ["git", "add", "-A"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-        )
-        if add_result.returncode != 0:
-            return False, f"git add 실패: {add_result.stderr.strip()}"
+        if files:
+            # Stage only the specified files
+            if not files:
+                return False, "커밋할 변경사항 없음"
+            # Use git add for each file - handles added, modified, and deleted files
+            add_result = subprocess.run(
+                ["git", "add", "--"] + files,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if add_result.returncode != 0:
+                return False, f"git add 실패: {add_result.stderr.strip()}"
+        else:
+            # Legacy behavior: stage all changes
+            add_result = subprocess.run(
+                ["git", "add", "-A"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if add_result.returncode != 0:
+                return False, f"git add 실패: {add_result.stderr.strip()}"
 
         staged_by_us = True
 
@@ -283,7 +310,7 @@ def git_commit(cwd: str, message: str) -> tuple[bool, str]:
         if commit_result.returncode != 0:
             stderr = commit_result.stderr.strip()
             # Commit failed - attempt to unstage changes to restore clean state
-            if _unstage_changes(cwd):
+            if _unstage_changes(cwd, files):
                 return False, f"git commit 실패 (변경사항 unstage됨): {stderr}"
             else:
                 return False, f"git commit 실패 (unstage도 실패): {stderr}"
@@ -292,12 +319,12 @@ def git_commit(cwd: str, message: str) -> tuple[bool, str]:
     except FileNotFoundError:
         # git binary not found - if we staged, try to unstage
         if staged_by_us:
-            _unstage_changes(cwd)
+            _unstage_changes(cwd, files)
         return False, "git을 찾을 수 없음"
     except Exception as e:
         # Unexpected error - if we staged, try to unstage
         if staged_by_us:
-            _unstage_changes(cwd)
+            _unstage_changes(cwd, files)
         return False, str(e)
 
 
