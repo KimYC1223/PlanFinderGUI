@@ -726,6 +726,7 @@ class MainWindow(QMainWindow):
                         self.log_panel.append_log(f"Translation failed: {e}", "warn")
             else:
                 from ..engine.translator import (
+                    TranslationTruncatedError,
                     save_translated_async,
                     translate_with_claude_async,
                 )
@@ -735,6 +736,19 @@ class MainWindow(QMainWindow):
                         content = filepath.read_text(encoding="utf-8")
                         translated = await translate_with_claude_async(content)
                         await save_translated_async(filepath, translated)
+                    except TranslationTruncatedError as te:
+                        # Save partial translation with truncation marker
+                        partial_with_marker = (
+                            te.partial_text
+                            + "\n\n---\n\n**[TRUNCATED]** This translation was cut off "
+                            "due to token limits. Consider using Google Translate for "
+                            "large documents.\n"
+                        )
+                        await save_translated_async(filepath, partial_with_marker)
+                        self.log_panel.append_log(
+                            f"Translation truncated: {filepath.name} (saved with marker)",
+                            "warn",
+                        )
                     except Exception as e:
                         self.log_panel.append_log(f"Translation failed: {e}", "warn")
 

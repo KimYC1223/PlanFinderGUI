@@ -1,10 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 
 from .fileutil import atomic_write
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+
+class TranslationTruncatedError(Exception):
+    """Raised when Claude API response is truncated due to max_tokens limit.
+
+    Attributes:
+        partial_text: The truncated translation text that was returned.
+        file_name: Optional file name being translated (for error messages).
+    """
+
+    def __init__(
+        self, partial_text: str, file_name: str | None = None, message: str | None = None
+    ) -> None:
+        self.partial_text = partial_text
+        self.file_name = file_name
+        if message is None:
+            file_info = f" for '{file_name}'" if file_name else ""
+            message = (
+                f"Translation was truncated{file_info} due to token limit. "
+                f"The document may be too large for a single translation. "
+                f"Consider using Google Translate for very large documents."
+            )
+        super().__init__(message)
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _anthropic_client():
@@ -139,6 +171,19 @@ def translate_with_claude(text: str, target_lang: str = "ko") -> str:
         messages=[{"role": "user", "content": masked}],
     )
 
+    # Check if the response was truncated due to token limit
+    if message.stop_reason == "max_tokens":
+        partial_text = message.content[0].text if message.content else ""
+        restored_partial = _unmask_code(partial_text, blocks)
+        _logger.warning(
+            "Translation truncated due to max_tokens limit. "
+            "Input length: %d chars, output length: %d chars. "
+            "Consider using Google Translate for large documents.",
+            len(text),
+            len(partial_text),
+        )
+        raise TranslationTruncatedError(partial_text=restored_partial)
+
     translated: str = message.content[0].text
     return _unmask_code(translated, blocks)
 
@@ -198,6 +243,19 @@ async def translate_with_claude_async(text: str, target_lang: str = "ko") -> str
         system=system_prompt,
         messages=[{"role": "user", "content": masked}],
     )
+
+    # Check if the response was truncated due to token limit
+    if message.stop_reason == "max_tokens":
+        partial_text = message.content[0].text if message.content else ""
+        restored_partial = _unmask_code(partial_text, blocks)
+        _logger.warning(
+            "Translation truncated due to max_tokens limit. "
+            "Input length: %d chars, output length: %d chars. "
+            "Consider using Google Translate for large documents.",
+            len(text),
+            len(partial_text),
+        )
+        raise TranslationTruncatedError(partial_text=restored_partial)
 
     translated: str = message.content[0].text
     return _unmask_code(translated, blocks)

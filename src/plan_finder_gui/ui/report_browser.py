@@ -67,6 +67,7 @@ class TranslationSignals(QObject):
     finished = Signal(Path, str)     # Emitted on success: (file_path, translated_text)
     error = Signal(Path, str)        # Emitted on error: (file_path, error_message)
     progress = Signal(int, int)      # Emitted for batch progress: (current, total)
+    truncated = Signal(Path, str)    # Emitted when translation is truncated: (file_path, partial_text)
 
 
 class TranslationWorker(QRunnable):
@@ -106,7 +107,12 @@ class TranslationWorker(QRunnable):
         self.signals.started.emit(self.file_path)
 
         try:
-            from ..engine.translator import save_translated, translate_with_claude, translate_with_google
+            from ..engine.translator import (
+                TranslationTruncatedError,
+                save_translated,
+                translate_with_claude,
+                translate_with_google,
+            )
 
             # Check cancellation again before the expensive network call
             if self.cancel_flag and self.cancel_flag[0]:
@@ -117,7 +123,19 @@ class TranslationWorker(QRunnable):
             if "Google" in self.method:
                 translated_text = translate_with_google(content)
             else:
-                translated_text = translate_with_claude(content)
+                try:
+                    translated_text = translate_with_claude(content)
+                except TranslationTruncatedError as te:
+                    # For truncated translations, save the partial text with a marker
+                    # and emit the truncated signal so the UI can warn the user
+                    partial_with_marker = (
+                        te.partial_text
+                        + "\n\n---\n\n**[TRUNCATED]** This translation was cut off due to "
+                        "token limits. Consider using Google Translate for large documents.\n"
+                    )
+                    save_translated(self.file_path, partial_with_marker)
+                    self.signals.truncated.emit(self.file_path, te.partial_text)
+                    return
 
             # Check cancellation before saving
             if self.cancel_flag and self.cancel_flag[0]:
@@ -1085,6 +1103,10 @@ class ReportBrowser(QWidget):
             lambda fp, err: self._on_single_translation_error(fp, err, progress),
             Qt.ConnectionType.QueuedConnection,
         )
+        worker.signals.truncated.connect(
+            lambda fp, _: self._on_single_translation_truncated(fp, progress),
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         # Submit to thread pool
         QThreadPool.globalInstance().start(worker)
@@ -1122,6 +1144,29 @@ class ReportBrowser(QWidget):
 
         sound_player.play_random("tscerr00.wav", "tscerr01.wav")
         QMessageBox.warning(self, "번역 실패", f"번역 중 오류가 발생했습니다:\n{error}")
+
+    def _on_single_translation_truncated(
+        self, path: Path, progress: QProgressDialog
+    ) -> None:
+        """Handle truncated translation (saved with [TRUNCATED] marker)."""
+        # Check if progress dialog is still valid
+        if self._translation_progress is not progress:
+            return
+
+        progress.close()
+        self._translation_progress = None
+
+        sound_player.play("tadupd02.wav")
+        QMessageBox.warning(
+            self,
+            "번역 결과 잘림",
+            f"'{path.name}' 번역이 토큰 제한으로 인해 잘렸습니다.\n\n"
+            "파일이 부분적으로 번역되어 저장되었습니다.\n"
+            "큰 문서의 경우 Google Translate 사용을 권장합니다.",
+        )
+
+        if self._current_file == path:
+            self._show_file(path)
 
     def _translate_all_files(self, files: list[Path]) -> None:
         """Translate multiple files using background worker threads.
@@ -1185,6 +1230,7 @@ class ReportBrowser(QWidget):
         self._translation_cancel_flag = [False]
         self._translation_pending_files = list(files)  # Copy to avoid mutation issues
         self._translation_errors = []
+        self._translation_truncated = []  # Files saved with [TRUNCATED] marker
         self._translation_success_count = 0
         self._translation_method = method
         total_files = len(files)
@@ -1255,6 +1301,10 @@ class ReportBrowser(QWidget):
             self._on_batch_file_error,
             Qt.ConnectionType.QueuedConnection,
         )
+        worker.signals.truncated.connect(
+            self._on_batch_file_truncated,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         QThreadPool.globalInstance().start(worker)
 
@@ -1276,6 +1326,21 @@ class ReportBrowser(QWidget):
         # Continue with next file (don't stop the batch on individual errors)
         self._start_next_batch_translation()
 
+    def _on_batch_file_truncated(self, path: Path, partial_text: str) -> None:
+        """Handle truncated translation for a file in batch mode.
+
+        The file was saved with a [TRUNCATED] marker appended. We track it
+        separately from errors since partial translations may still be useful.
+        """
+        self._translation_truncated.append(path.name)
+
+        # Update viewer if this file is currently displayed
+        if self._current_file == path:
+            self._show_file(path)
+
+        # Continue with next file
+        self._start_next_batch_translation()
+
     def _on_batch_translation_cancelled(self) -> None:
         """Handle user cancellation of batch translation."""
         self._translation_cancel_flag[0] = True
@@ -1291,6 +1356,7 @@ class ReportBrowser(QWidget):
             self._translation_progress = None
 
         errors = self._translation_errors
+        truncated = getattr(self, "_translation_truncated", [])
         success_count = self._translation_success_count
         was_cancelled = self._translation_cancel_flag[0]
         remaining = len(self._translation_pending_files)
@@ -1298,12 +1364,23 @@ class ReportBrowser(QWidget):
         # Reset state
         self._translation_pending_files = []
         self._translation_errors = []
+        self._translation_truncated = []
         self._translation_success_count = 0
+
+        # Build truncated warning section if any
+        truncated_section = ""
+        if truncated:
+            truncated_section = (
+                f"\n\n잘림(부분 저장): {len(truncated)}개\n"
+                + "\n".join(truncated[:5])
+                + ("\n..." if len(truncated) > 5 else "")
+                + "\n\n(큰 파일은 Google Translate를 권장합니다.)"
+            )
 
         # Show summary
         if was_cancelled and remaining > 0:
             # User cancelled with files remaining
-            if errors:
+            if errors or truncated:
                 sound_player.play_random("tscerr00.wav", "tscerr01.wav")
                 QMessageBox.warning(
                     self,
@@ -1313,7 +1390,8 @@ class ReportBrowser(QWidget):
                     f"실패: {len(errors)}개\n"
                     f"취소됨: {remaining}개\n\n"
                     f"실패한 파일:\n" + "\n".join(errors[:10])
-                    + ("\n..." if len(errors) > 10 else ""),
+                    + ("\n..." if len(errors) > 10 else "")
+                    + truncated_section,
                 )
             else:
                 QMessageBox.information(
@@ -1323,17 +1401,18 @@ class ReportBrowser(QWidget):
                     f"완료: {success_count}개\n"
                     f"취소됨: {remaining}개",
                 )
-        elif errors:
-            # Completed with some errors
+        elif errors or truncated:
+            # Completed with some errors or truncations
             sound_player.play_random("tscerr00.wav", "tscerr01.wav")
             QMessageBox.warning(
                 self,
-                "번역 일부 실패",
+                "번역 일부 실패" if errors else "번역 일부 잘림",
                 f"번역이 완료되었습니다.\n\n"
                 f"성공: {success_count}개\n"
-                f"실패: {len(errors)}개\n\n"
-                f"실패한 파일:\n" + "\n".join(errors[:10])
-                + ("\n..." if len(errors) > 10 else ""),
+                + (f"실패: {len(errors)}개\n\n" if errors else "")
+                + (f"실패한 파일:\n" + "\n".join(errors[:10])
+                   + ("\n..." if len(errors) > 10 else "") if errors else "")
+                + truncated_section,
             )
         elif success_count > 0:
             # All successful
