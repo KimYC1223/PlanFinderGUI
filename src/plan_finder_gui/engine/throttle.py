@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from collections.abc import Callable
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_BUDGET = 40.0  # $40 per session
 
@@ -91,10 +94,29 @@ def _parse_ccusage_result(json_result: subprocess.CompletedProcess) -> dict:
             f"ccusage returned active block with malformed date string: {e}"
         ) from e
 
+    # Defensive parsing of costUSD field - raise if missing, warn if wrong type
+    if "costUSD" not in active_block:
+        raise NoActiveSession(
+            "ccusage returned active block without costUSD field - "
+            "ccusage version may be incompatible"
+        )
+
+    cost_usd_raw = active_block["costUSD"]
+    if isinstance(cost_usd_raw, (int, float)):
+        cost_usd = float(cost_usd_raw)
+    else:
+        logger.warning(
+            "ccusage returned costUSD with unexpected type %s (value: %r), "
+            "falling back to 0.0. Check ccusage version compatibility.",
+            type(cost_usd_raw).__name__,
+            cost_usd_raw,
+        )
+        cost_usd = 0.0
+
     return {
         "session_start": session_start,
         "session_end": session_end,
-        "cost_usd": active_block.get("costUSD", 0.0),
+        "cost_usd": cost_usd,
         "models": active_block.get("models", []),
     }
 

@@ -298,3 +298,119 @@ class TestParseCcusageResultMalformedTimeFields:
 
         # Should be caught by TypeError/AttributeError (int has no .replace method)
         assert "invalid time value" in str(exc_info.value) or "null or wrong type" in str(exc_info.value)
+
+
+class TestParseCcusageResultCostUSDValidation:
+    """Tests for _parse_ccusage_result handling of missing or malformed costUSD field."""
+
+    def test_raises_no_active_session_when_cost_usd_missing(self):
+        """Should raise NoActiveSession when active block is missing 'costUSD' key.
+
+        This prevents silent budget tracking failures if ccusage renames the field
+        (e.g., to 'cost', 'cost_usd', or 'totalCostUSD').
+        """
+        # Valid JSON with active block, but costUSD field is missing
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    # Missing costUSD field - simulating a renamed field
+                    "cost": 5.0,  # Hypothetical renamed field
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "without costUSD field" in str(exc_info.value)
+        assert "ccusage version may be incompatible" in str(exc_info.value)
+
+    def test_raises_no_active_session_when_cost_usd_renamed_to_total_cost(self):
+        """Should raise NoActiveSession when costUSD is renamed to totalCostUSD."""
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "totalCostUSD": 5.0,  # Hypothetical renamed field
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with pytest.raises(NoActiveSession) as exc_info:
+            _parse_ccusage_result(mock_result)
+
+        assert "without costUSD field" in str(exc_info.value)
+
+    def test_logs_warning_when_cost_usd_is_wrong_type(self, caplog):
+        """Should log warning and fallback to 0.0 when costUSD has unexpected type."""
+        import logging
+
+        # Valid JSON with active block, but costUSD is a string instead of number
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": "5.00",  # String instead of number
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        with caplog.at_level(logging.WARNING):
+            result = _parse_ccusage_result(mock_result)
+
+        # Should fallback to 0.0 and log a warning
+        assert result["cost_usd"] == 0.0
+        assert "unexpected type" in caplog.text
+        assert "str" in caplog.text
+
+    def test_parses_cost_usd_correctly_when_valid(self):
+        """Should correctly parse costUSD when it is a valid number."""
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": 15.75,
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        result = _parse_ccusage_result(mock_result)
+
+        assert result["cost_usd"] == 15.75
+
+    def test_parses_cost_usd_correctly_when_integer(self):
+        """Should correctly parse costUSD when it is an integer (not float)."""
+        ccusage_output = json.dumps({
+            "blocks": [
+                {
+                    "isActive": True,
+                    "startTime": "2026-05-16T08:00:00Z",
+                    "endTime": "2026-05-16T12:00:00Z",
+                    "costUSD": 10,  # Integer instead of float
+                    "models": ["claude-3-opus"],
+                }
+            ]
+        })
+        mock_result = _make_completed_process(ccusage_output)
+
+        result = _parse_ccusage_result(mock_result)
+
+        assert result["cost_usd"] == 10.0
+        assert isinstance(result["cost_usd"], float)

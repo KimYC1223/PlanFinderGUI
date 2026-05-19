@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -74,8 +77,38 @@ class _Worker(QObject):
                         start_str = block.get("startTime", "")
                         dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
                         if dt.astimezone().replace(tzinfo=None).date() == today:
-                            result["today_cost"] += block.get("costUSD", 0.0)
-                            result["today_tokens"] += block.get("totalTokens", 0)
+                            # Defensive parsing of cost/token fields
+                            cost_val = block.get("costUSD")
+                            if cost_val is None:
+                                logger.warning(
+                                    "ccusage block missing costUSD field - "
+                                    "ccusage version may be incompatible"
+                                )
+                                cost_val = 0.0
+                            elif not isinstance(cost_val, (int, float)):
+                                logger.warning(
+                                    "ccusage costUSD has unexpected type %s (value: %r)",
+                                    type(cost_val).__name__,
+                                    cost_val,
+                                )
+                                cost_val = 0.0
+                            result["today_cost"] += cost_val
+
+                            tokens_val = block.get("totalTokens")
+                            if tokens_val is None:
+                                logger.warning(
+                                    "ccusage block missing totalTokens field - "
+                                    "ccusage version may be incompatible"
+                                )
+                                tokens_val = 0
+                            elif not isinstance(tokens_val, int):
+                                logger.warning(
+                                    "ccusage totalTokens has unexpected type %s (value: %r)",
+                                    type(tokens_val).__name__,
+                                    tokens_val,
+                                )
+                                tokens_val = 0
+                            result["today_tokens"] += tokens_val
                     except Exception:
                         pass
         except FileNotFoundError:
@@ -292,7 +325,21 @@ class ClaudeSessionPanel(QWidget):
             except Exception:
                 self._sess_time.setText("  시간: 파싱 오류")
 
-            cost = sess.get("costUSD", 0.0)
+            # Defensive parsing of costUSD for display
+            cost = sess.get("costUSD")
+            if cost is None:
+                logger.warning(
+                    "Active session missing costUSD field - "
+                    "ccusage version may be incompatible"
+                )
+                cost = 0.0
+            elif not isinstance(cost, (int, float)):
+                logger.warning(
+                    "Active session costUSD has unexpected type %s (value: %r)",
+                    type(cost).__name__,
+                    cost,
+                )
+                cost = 0.0
             self._sess_cost.setText(f"  비용: ${cost:.2f}")
 
             models = [m for m in sess.get("models", []) if m != "<synthetic>"]
