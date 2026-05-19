@@ -661,7 +661,7 @@ class ReportBrowser(QWidget):
             # Group files by keyword (files without one fall under "Unassigned").
             by_keyword: dict[str, list[Path]] = {}
             for f in files:
-                kw = _extract_keyword(f) or "Unassigned"
+                kw = _get_cached_keyword(f) or "Unassigned"
                 by_keyword.setdefault(kw, []).append(f)
 
             color = _CATEGORY_COLORS.get(cat, "#ccc")
@@ -705,6 +705,9 @@ class ReportBrowser(QWidget):
 
     def _purge_stale_chat_state(self) -> None:
         """Remove chat state for files that no longer exist on disk."""
+        # Purge stale keyword cache entries
+        _purge_keyword_cache()
+
         if not self._chat_blocks:
             return
         stale = [p for p in self._chat_blocks if not p.exists()]
@@ -1960,6 +1963,10 @@ _META_KEYWORD_RE = re.compile(r"Keyword:\s*([^|\n]+?)(?:\s*\||\s*$)")
 _TITLE_CLASS_RE  = re.compile(r"^#\s+([A-Z][A-Za-z0-9_]+)([:\.\(]|\s|$)")
 _CAMEL_CASE_RE   = re.compile(r"[a-z][A-Z]")
 
+# Cache for keyword extraction: maps file path to (mtime, keyword).
+# This avoids re-reading files on every refresh when content hasn't changed.
+_keyword_cache: dict[Path, tuple[float, str | None]] = {}
+
 
 def _extract_keyword(path: Path) -> str | None:
     """Pull the Keyword tag out of a plan markdown file, if present.
@@ -2003,6 +2010,52 @@ def _extract_keyword(path: Path) -> str | None:
                 return ident
             break
     return None
+
+
+def _get_cached_keyword(path: Path) -> str | None:
+    """Return keyword for a plan file, using cache to avoid redundant reads.
+
+    The cache key is the file path, and the value is (mtime, keyword). If the
+    file's mtime matches the cached mtime, the cached keyword is returned
+    without re-reading the file.
+
+    Args:
+        path: Path to the markdown plan file.
+
+    Returns:
+        The extracted keyword, or None if not found.
+    """
+    global _keyword_cache
+
+    try:
+        current_mtime = path.stat().st_mtime
+    except OSError:
+        # File doesn't exist or is inaccessible
+        _keyword_cache.pop(path, None)
+        return None
+
+    # Check cache hit
+    cached = _keyword_cache.get(path)
+    if cached is not None:
+        cached_mtime, cached_keyword = cached
+        if cached_mtime == current_mtime:
+            return cached_keyword
+
+    # Cache miss: extract keyword and store in cache
+    keyword = _extract_keyword(path)
+    _keyword_cache[path] = (current_mtime, keyword)
+
+    # Safeguard against unbounded cache growth
+    if len(_keyword_cache) > 2000:
+        _keyword_cache.clear()
+
+    return keyword
+
+
+def _purge_keyword_cache() -> None:
+    """Remove cache entries for files that no longer exist on disk."""
+    global _keyword_cache
+    _keyword_cache = {p: v for p, v in _keyword_cache.items() if p.exists()}
 
 
 def _read_team_members(s: QSettings) -> list[str]:
