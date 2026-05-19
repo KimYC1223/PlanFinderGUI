@@ -25,14 +25,22 @@ class ExistingPlanSummary:
 def _parse_plan_filename(stem: str) -> tuple[str, str, str]:
     """Recover (keyword, title, timestamp_str) from a plan file stem.
 
-    Save format is `<Keyword>__<YYYYMMDD>_<HHMMSS>_<safe-title>`.
+    Save format is `<Keyword>__<YYYYMMDD>_<HHMMSS>_<microseconds>_<safe-title>`.
+    Older files without microseconds (`<Keyword>__<YYYYMMDD>_<HHMMSS>_<safe-title>`)
+    are also supported for backward compatibility.
     Falls back to ("Unassigned", stem, "") when the pattern doesn't match.
     The timestamp_str is in YYYYMMDD_HHMMSS format for lexicographic sorting.
     """
     if "__" in stem:
         keyword, rest = stem.split("__", 1)
-        parts = rest.split("_", 2)
-        if len(parts) >= 3:
+        parts = rest.split("_", 3)
+        if len(parts) >= 4 and len(parts[2]) == 6 and parts[2].isdigit():
+            # New format with microseconds
+            # parts[0] = YYYYMMDD, parts[1] = HHMMSS, parts[2] = microseconds, parts[3] = safe-title
+            timestamp_str = f"{parts[0]}_{parts[1]}"
+            title = parts[3].replace("-", " ").strip() or stem
+        elif len(parts) >= 3:
+            # Old format without microseconds
             # parts[0] = YYYYMMDD, parts[1] = HHMMSS, parts[2] = safe-title
             timestamp_str = f"{parts[0]}_{parts[1]}"
             title = parts[2].replace("-", " ").strip() or stem
@@ -160,11 +168,15 @@ def save_plan(
 
     Uses atomic write (temp file + fsync + os.replace) to prevent corruption
     if the process crashes during the write operation.
+
+    Filename includes microseconds for sub-second precision, plus collision
+    detection with counter suffix to prevent silent overwrites.
     """
     target_dir = report_dir / "pending" if pending else report_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Include microseconds for sub-second precision to reduce collision risk
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_title = (
         plan.title.lower().replace(" ", "-").replace("/", "-").replace("\\", "-")
     )
@@ -174,8 +186,19 @@ def save_plan(
     raw_keyword = (plan.keyword or "").strip() or "Unassigned"
     safe_keyword = "".join(c for c in raw_keyword if c.isalnum())[:32] or "Unassigned"
 
-    filename = f"{safe_keyword}__{timestamp}_{safe_title}.md"
-    filepath = target_dir / filename
+    base_filename = f"{safe_keyword}__{timestamp}_{safe_title}"
+    filepath = target_dir / f"{base_filename}.md"
+
+    # Collision detection: append counter suffix if file already exists
+    counter = 2
+    while filepath.exists():
+        logger.warning(
+            "Plan filename collision detected: %s already exists, trying suffix _%d",
+            filepath.name,
+            counter,
+        )
+        filepath = target_dir / f"{base_filename}_{counter}.md"
+        counter += 1
 
     content = generate_markdown(plan, iteration, pending=pending)
     atomic_write(filepath, content)
