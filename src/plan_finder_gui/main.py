@@ -11,9 +11,23 @@ from pathlib import Path
 
 import qasync
 from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
 
 from .ui.main_window import MainWindow
+
+
+def _resolve_app_icon_path() -> Path:
+    """Return the platform-appropriate app icon path (frozen vs dev)."""
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS) / "img"  # type: ignore[attr-defined]
+    else:
+        base = Path(__file__).parents[2] / "img"
+    if sys.platform == "win32":
+        return base / "scv.ico"
+    if sys.platform == "darwin":
+        return base / "scv.icns"
+    return base / "scv.webp"
 
 
 def _get_crash_log_dir() -> Path:
@@ -286,9 +300,25 @@ def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+    # Windows: associate the running process with our own AppUserModelID so
+    # the taskbar groups the app under our icon instead of the default
+    # python.exe / generic icon. Must run before the first window is shown.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com.planfinder.gui"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("Plan Finder")
     app.setOrganizationName("PlanFinderGUI")
+
+    _icon_path = _resolve_app_icon_path()
+    if _icon_path.exists():
+        app.setWindowIcon(QIcon(str(_icon_path)))
 
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)

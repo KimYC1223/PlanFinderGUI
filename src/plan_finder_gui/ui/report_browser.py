@@ -25,6 +25,7 @@ from PySide6.QtCore import (
     Slot,
 )
 from . import sound_player
+from .icon_loader import load_icon
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -472,11 +473,11 @@ class ReportBrowser(QWidget):
         btn_layout.setContentsMargins(8, 6, 8, 6)
         btn_layout.setSpacing(6)
 
-        self._resolve_btn  = _action_btn("✓  Resolve", "#2e7d32", "#388e3c")
-        self._reject_btn_a = _action_btn("✗  Reject",  "#c62828", "#d32f2f")
-        self._share_btn    = _action_btn("⬆  Share",   "#e65100", "#f57c00")
-        self._restart_btn  = _action_btn("↺  Restart", "#0d47a1", "#1565c0")
-        self._restore_btn  = _action_btn("↩  Restore", "#4a4a4a", "#5a5a5a")
+        self._resolve_btn  = _action_btn("Resolve", "#2e7d32", "#388e3c", icon_name="check")
+        self._reject_btn_a = _action_btn("Reject",  "#c62828", "#d32f2f", icon_name="x")
+        self._share_btn    = _action_btn("Share",   "#e65100", "#f57c00", icon_name="share")
+        self._restart_btn  = _action_btn("Restart", "#0d47a1", "#1565c0", icon_name="restart")
+        self._restore_btn  = _action_btn("Restore", "#4a4a4a", "#5a5a5a", icon_name="restore")
 
         for btn in (self._resolve_btn, self._reject_btn_a, self._share_btn, self._restart_btn, self._restore_btn):
             btn_layout.addWidget(btn)
@@ -965,7 +966,8 @@ class ReportBrowser(QWidget):
             my_name = str(s.value("team/my_name", "") or "").strip()
             members = [m for m in _read_team_members(s) if m != my_name]
             menu.addSeparator()
-            share_menu = menu.addMenu("⬆  공유하기")
+            share_menu = menu.addMenu("공유하기")
+            share_menu.menuAction().setIcon(load_icon("share", "#cccccc"))
             share_menu.setStyleSheet(_menu_style)
             if members:
                 for member in members:
@@ -1586,17 +1588,15 @@ class ReportBrowser(QWidget):
 
         if cats == {"pending"}:
             self._resolve_btn.setVisible(True)
-            self._resolve_btn.setEnabled(not self._is_running)
-            self._resolve_btn.setToolTip(
-                "Cannot resolve while another session is running" if self._is_running else ""
-            )
+            self._resolve_btn.setEnabled(True)
+            self._resolve_btn.setToolTip("")
             self._reject_btn_a.setVisible(True)
             self._reject_btn_a.setEnabled(True)
             self._reject_btn_a.setToolTip("")
             self._share_btn.setVisible(True)
         elif cats == {"working"}:
             self._restart_btn.setVisible(True)
-            self._restart_btn.setEnabled(not self._is_running)
+            self._restart_btn.setEnabled(True)
         elif cats == {"reject"} or cats == {"reviewed"}:
             self._restore_btn.setVisible(True)
 
@@ -1965,7 +1965,13 @@ def _md_to_html(text: str) -> str:
     return md_lib.markdown(text, extensions=["fenced_code", "tables"])
 
 
-def _action_btn(label: str, bg: str, hover_bg: str) -> QPushButton:
+def _action_btn(
+    label: str,
+    bg: str,
+    hover_bg: str,
+    icon_name: str | None = None,
+    icon_color: str = "#ffffff",
+) -> QPushButton:
     btn = QPushButton(label)
     btn.setFixedHeight(28)
     btn.setStyleSheet(
@@ -1974,6 +1980,11 @@ def _action_btn(label: str, bg: str, hover_bg: str) -> QPushButton:
         f"QPushButton:hover {{ background: {hover_bg}; }}"
         f"QPushButton:disabled {{ background: #333; color: #555; }}"
     )
+    if icon_name:
+        from PySide6.QtCore import QSize
+        from .icon_loader import load_icon
+        btn.setIcon(load_icon(icon_name, icon_color))
+        btn.setIconSize(QSize(14, 14))
     return btn
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
+
+from .icon_loader import load_icon
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -165,24 +167,30 @@ class PlanCard(QWidget):
 
         # Action buttons
         btn_row = QHBoxLayout()
-        self._approve_btn = QPushButton("✓  Approve (Ctrl+A)")
+        self._approve_btn = QPushButton("Approve (Ctrl+A)")
+        self._approve_btn.setIcon(load_icon("check"))
+        self._approve_btn.setIconSize(QSize(16, 16))
         self._approve_btn.setFixedHeight(36)
         self._approve_btn.setStyleSheet(
-            "QPushButton { background: #2e7d32; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; }"
+            "QPushButton { background: #2e7d32; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; padding: 0 12px; }"
             "QPushButton:hover { background: #388e3c; }"
             "QPushButton:disabled { background: #333; color: #666; }"
         )
-        self._reject_btn = QPushButton("✗  Reject (Ctrl+R)")
+        self._reject_btn = QPushButton("Reject (Ctrl+R)")
+        self._reject_btn.setIcon(load_icon("x"))
+        self._reject_btn.setIconSize(QSize(16, 16))
         self._reject_btn.setFixedHeight(36)
         self._reject_btn.setStyleSheet(
-            "QPushButton { background: #b71c1c; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; }"
+            "QPushButton { background: #b71c1c; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; padding: 0 12px; }"
             "QPushButton:hover { background: #c62828; }"
             "QPushButton:disabled { background: #333; color: #666; }"
         )
-        self._revise_btn = QPushButton("↺  Revise… (Ctrl+E)")
+        self._revise_btn = QPushButton("Revise… (Ctrl+E)")
+        self._revise_btn.setIcon(load_icon("restart"))
+        self._revise_btn.setIconSize(QSize(16, 16))
         self._revise_btn.setFixedHeight(36)
         self._revise_btn.setStyleSheet(
-            "QPushButton { background: #0d47a1; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; }"
+            "QPushButton { background: #0d47a1; color: white; border-radius: 4px; font-size: 13px; font-weight: bold; padding: 0 12px; }"
             "QPushButton:hover { background: #1565c0; }"
             "QPushButton:disabled { background: #333; color: #666; }"
         )

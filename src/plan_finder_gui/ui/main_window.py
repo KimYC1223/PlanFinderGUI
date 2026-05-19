@@ -249,7 +249,11 @@ class MainWindow(QMainWindow):
         dlg.setFixedWidth(420)
         dlg.setStyleSheet(
             "QDialog { background: #252526; color: #ccc; }"
-            "QLabel { color: #ccc; }"
+            "QLabel {"
+            "  color: #ccc;"
+            "  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Segoe UI';"
+            "  padding: 2px 0;"
+            "}"
             "QLabel a { color: #4fc3f7; text-decoration: none; }"
             "QPushButton {"
             "  background: #0e639c; color: white;"
@@ -583,7 +587,11 @@ class MainWindow(QMainWindow):
         mb.setInformativeText(msg)
         mb.setStyleSheet(
             "QMessageBox { background: #252526; color: #ccc; }"
-            "QLabel { color: #ccc; }"
+            "QLabel {"
+            "  color: #ccc;"
+            "  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Segoe UI';"
+            "  padding: 2px 0;"
+            "}"
             "QPushButton {"
             "  background: #333; color: #ccc; border: 1px solid #444;"
             "  border-radius: 4px; padding: 5px 14px; min-width: 80px;"
@@ -1178,7 +1186,11 @@ class MainWindow(QMainWindow):
         )
         mb.setStyleSheet(
             "QMessageBox { background: #252526; color: #ccc; }"
-            "QLabel { color: #ccc; }"
+            "QLabel {"
+            "  color: #ccc;"
+            "  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Segoe UI';"
+            "  padding: 2px 0;"
+            "}"
             "QPushButton {"
             "  background: #333; color: #ccc; border: 1px solid #444;"
             "  border-radius: 4px; padding: 5px 14px; min-width: 80px;"

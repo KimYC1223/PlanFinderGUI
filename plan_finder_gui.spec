@@ -25,6 +25,7 @@ a = Analysis(
         'PySide6.QtGui',
         'PySide6.QtWidgets',
         'PySide6.QtMultimedia',
+        'PySide6.QtSvg',
         'qasync',
         'markdown',
         'psutil',
