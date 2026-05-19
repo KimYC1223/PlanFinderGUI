@@ -3,11 +3,153 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
 
 import qasync
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from .ui.main_window import MainWindow
+
+
+def _get_crash_log_dir() -> Path:
+    """Return the crash log directory, creating it if necessary."""
+    if sys.platform == "win32":
+        base = Path.home() / "AppData" / "Local" / "plan_finder_gui"
+    else:
+        base = Path.home() / ".plan_finder_gui"
+    crash_dir = base / "crash_logs"
+    crash_dir.mkdir(parents=True, exist_ok=True)
+    return crash_dir
+
+
+def _write_crash_log(exc_info: str) -> Path | None:
+    """Write crash details to a timestamped log file. Returns the path or None on failure."""
+    try:
+        crash_dir = _get_crash_log_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = crash_dir / f"crash_{timestamp}.log"
+        log_path.write_text(exc_info, encoding="utf-8")
+        return log_path
+    except Exception:
+        return None
+
+
+def _show_crash_dialog(title: str, summary: str, details: str) -> None:
+    """Show a crash dialog with Copy to Clipboard functionality."""
+    try:
+        # Check if QApplication exists
+        app = QApplication.instance()
+        if app is None:
+            # No Qt app yet, just print to stderr
+            print(f"{title}\n{summary}\n{details}", file=sys.stderr)
+            return
+
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText(summary)
+        # Truncate details for the detailed text area if too long
+        if len(details) > 10000:
+            details = details[:10000] + "\n\n... (truncated, see crash log for full details)"
+        box.setDetailedText(details)
+
+        # Add Copy to Clipboard button
+        copy_btn = QPushButton("Copy to Clipboard")
+        box.addButton(copy_btn, QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+
+        def _copy_to_clipboard() -> None:
+            clipboard = QApplication.clipboard()
+            if clipboard:
+                clipboard.setText(f"{summary}\n\n{details}")
+
+        copy_btn.clicked.connect(_copy_to_clipboard)
+
+        box.exec()
+    except Exception:
+        # Fallback: if dialog fails, at least print to stderr
+        print(f"{title}\n{summary}\n{details}", file=sys.stderr)
+
+
+def _global_exception_handler(exc_type, exc_value, exc_tb) -> None:
+    """Global exception handler for uncaught exceptions."""
+    # Don't intercept KeyboardInterrupt
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+
+    try:
+        # Format the exception
+        tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+        exc_info = "".join(tb_lines)
+
+        # Always log to stderr
+        print(f"[UNCAUGHT EXCEPTION]\n{exc_info}", file=sys.stderr)
+
+        # Write crash log
+        log_path = _write_crash_log(exc_info)
+        log_msg = f"\nCrash log saved to: {log_path}" if log_path else ""
+
+        # Show dialog
+        _show_crash_dialog(
+            title="Plan Finder - Unexpected Error",
+            summary=(
+                f"An unexpected error occurred: {exc_type.__name__}\n\n"
+                f"{exc_value}\n"
+                f"{log_msg}"
+            ),
+            details=exc_info,
+        )
+    except Exception as handler_exc:
+        # Guard against recursive crash - last resort fallback
+        print(f"[EXCEPTION IN EXCEPTION HANDLER]: {handler_exc}", file=sys.stderr)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _asyncio_exception_handler(loop, context) -> None:
+    """Exception handler for asyncio tasks."""
+    try:
+        exception = context.get("exception")
+
+        # Ignore CancelledError - it's expected during shutdown
+        if exception is not None and isinstance(exception, asyncio.CancelledError):
+            return
+
+        # Format error message
+        message = context.get("message", "Unhandled exception in asyncio task")
+        task = context.get("task")
+        task_info = f"\nTask: {task}" if task else ""
+
+        if exception is not None:
+            tb_lines = traceback.format_exception(type(exception), exception, exception.__traceback__)
+            exc_info = "".join(tb_lines)
+        else:
+            exc_info = str(context)
+
+        full_details = f"{message}{task_info}\n\n{exc_info}"
+
+        # Always log to stderr
+        print(f"[ASYNCIO EXCEPTION]\n{full_details}", file=sys.stderr)
+
+        # Write crash log
+        log_path = _write_crash_log(full_details)
+        log_msg = f"\nCrash log saved to: {log_path}" if log_path else ""
+
+        # Show dialog (non-fatal for asyncio - don't exit)
+        _show_crash_dialog(
+            title="Plan Finder - Background Task Error",
+            summary=(
+                f"An error occurred in a background task.\n\n"
+                f"{message}{log_msg}"
+            ),
+            details=full_details,
+        )
+    except Exception as handler_exc:
+        # Guard against recursive crash
+        print(f"[EXCEPTION IN ASYNCIO HANDLER]: {handler_exc}", file=sys.stderr)
+        loop.default_exception_handler(context)
 
 
 def _suppress_windows_subprocess_consoles() -> None:
@@ -39,6 +181,9 @@ def _suppress_windows_subprocess_consoles() -> None:
 def main() -> None:
     _suppress_windows_subprocess_consoles()
 
+    # Install global exception handler early, before any Qt/asyncio setup
+    sys.excepthook = _global_exception_handler
+
     # macOS .app bundles launched from Finder/Dock don't inherit the shell
     # PATH, so /opt/homebrew/bin and nvm-managed Node bins are missing. Pull
     # them in before any subprocess (ccusage, claude, npm, brew) is spawned.
@@ -55,6 +200,9 @@ def main() -> None:
 
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
+
+    # Install asyncio exception handler for unhandled exceptions in coroutines
+    loop.set_exception_handler(_asyncio_exception_handler)
 
     window = MainWindow()
     window.setWindowTitle("Plan Finder")

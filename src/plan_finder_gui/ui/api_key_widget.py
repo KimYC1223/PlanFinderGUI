@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -45,10 +46,17 @@ class _ApiKeyValidator(QObject):
     def __init__(self, key: str) -> None:
         super().__init__()
         self._key = key
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Mark this validator as cancelled so it won't emit signals."""
+        self._cancelled = True
 
     def run(self) -> None:
         valid = _validate_anthropic_key(self._key)
-        self.finished.emit(valid, self._key)
+        # Only emit if not cancelled to avoid signaling a destroyed widget
+        if not self._cancelled:
+            self.finished.emit(valid, self._key)
 
 
 _INFO_API_KEY = (
@@ -127,6 +135,22 @@ class ApiKeyEditor(QWidget):
     def _on_text_changed(self, _text: str) -> None:
         self._timer.start()
 
+    def _cancel_validation(self, timeout_ms: int = 100) -> None:
+        """Cancel any in-flight validation thread.
+
+        Marks the worker as cancelled so it won't emit signals, then
+        requests the thread to quit and waits up to `timeout_ms` for it
+        to finish. If the thread doesn't finish in time, we let it
+        complete in the background (the cancelled flag prevents signals).
+        """
+        if self._validator_worker is not None:
+            self._validator_worker.cancel()
+        if self._validator_thread is not None and self._validator_thread.isRunning():
+            self._validator_thread.quit()
+            self._validator_thread.wait(timeout_ms)
+        self._validator_thread = None
+        self._validator_worker = None
+
     def _set_status(self, *, using_user_key: bool) -> None:
         if using_user_key:
             self.api_key_status_label.setText(
@@ -146,6 +170,9 @@ class ApiKeyEditor(QWidget):
             )
 
     def _start_validation(self) -> None:
+        # Cancel any in-flight validation before starting a new one.
+        self._cancel_validation()
+
         key = self.api_key_edit.text().strip()
         if not key:
             QSettings().remove("anthropic_api_key")
@@ -183,6 +210,11 @@ class ApiKeyEditor(QWidget):
         else:
             QSettings().remove("anthropic_api_key")
             self._set_status(using_user_key=False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Cancel any in-flight validation before the widget is destroyed."""
+        self._cancel_validation()
+        super().closeEvent(event)
 
 
 def _info_btn(text: str) -> QPushButton:
