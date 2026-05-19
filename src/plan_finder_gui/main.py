@@ -12,6 +12,7 @@ from pathlib import Path
 import qasync
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
 
 from .ui.main_window import MainWindow
@@ -195,6 +196,104 @@ def _suppress_windows_subprocess_consoles() -> None:
     subprocess.Popen.__init__ = _patched_init
 
 
+class SingleInstanceGuard:
+    """Prevents multiple instances of the application from running simultaneously.
+
+    Uses QLocalServer to detect and communicate between instances. When a second
+    instance starts, it notifies the first instance (which can bring itself to
+    the foreground) and exits gracefully.
+
+    This helps prevent race conditions in StateManager when multiple processes
+    try to modify the same .state.json file concurrently.
+    """
+
+    # Unique server name for this application
+    _SERVER_NAME = "plan_finder_gui_single_instance_lock"
+
+    def __init__(self) -> None:
+        self._server: QLocalServer | None = None
+        self._socket: QLocalSocket | None = None
+        self._is_primary = False
+
+    def try_acquire(self) -> bool:
+        """Attempt to become the primary (single) instance.
+
+        Returns:
+            True if this instance is now the primary instance.
+            False if another instance is already running.
+        """
+        # Try to connect to an existing server (another instance)
+        self._socket = QLocalSocket()
+        self._socket.connectToServer(self._SERVER_NAME)
+
+        if self._socket.waitForConnected(500):
+            # Another instance is running - send activation message
+            self._socket.write(b"activate")
+            self._socket.flush()
+            self._socket.waitForBytesWritten(1000)
+            self._socket.disconnectFromServer()
+            return False
+
+        # No other instance - create the server
+        self._server = QLocalServer()
+
+        # Clean up any stale socket file from a previous crash
+        QLocalServer.removeServer(self._SERVER_NAME)
+
+        if not self._server.listen(self._SERVER_NAME):
+            # Failed to create server - might be a race condition
+            # Try one more time to connect
+            self._socket.connectToServer(self._SERVER_NAME)
+            if self._socket.waitForConnected(500):
+                self._socket.write(b"activate")
+                self._socket.flush()
+                self._socket.waitForBytesWritten(1000)
+                self._socket.disconnectFromServer()
+                return False
+            # Still can't connect or create server - proceed anyway
+            print(
+                "[SingleInstanceGuard] Warning: Could not create server or connect "
+                "to existing instance. Proceeding anyway.",
+                file=sys.stderr,
+            )
+            return True
+
+        self._is_primary = True
+        return True
+
+    def set_activation_callback(self, callback) -> None:
+        """Set a callback to be invoked when another instance requests activation.
+
+        The callback typically brings the main window to the foreground.
+
+        Args:
+            callback: A callable that takes no arguments.
+        """
+        if self._server is None:
+            return
+
+        def _on_new_connection():
+            client = self._server.nextPendingConnection()
+            if client:
+                # Read the message (we don't really need it, but clear the buffer)
+                if client.waitForReadyRead(1000):
+                    _ = client.readAll()
+                client.disconnectFromServer()
+                # Invoke the activation callback
+                callback()
+
+        self._server.newConnection.connect(_on_new_connection)
+
+    def release(self) -> None:
+        """Release the single-instance lock."""
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        if self._socket is not None:
+            self._socket.disconnectFromServer()
+            self._socket = None
+
+
 class _CliVersionWorker(QObject):
     """Worker that checks the CLI version in a background thread."""
 
@@ -313,6 +412,36 @@ def main() -> None:
             pass
 
     app = QApplication(sys.argv)
+
+    # Single-instance detection to prevent concurrent state file access
+    # This must be done after QApplication is created (QLocalServer needs it)
+    instance_guard = SingleInstanceGuard()
+    if not instance_guard.try_acquire():
+        # Another instance is already running
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Plan Finder Already Running")
+        box.setText(
+            "Another instance of Plan Finder is already running.\n\n"
+            "Running multiple instances on the same project can cause "
+            "data conflicts in the state file.\n\n"
+            "Click 'Switch to Existing' to activate the existing window, "
+            "or 'Open Anyway' to proceed (not recommended)."
+        )
+        switch_btn = box.addButton("Switch to Existing", QMessageBox.ButtonRole.AcceptRole)
+        open_btn = box.addButton("Open Anyway", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(switch_btn)
+        box.exec()
+
+        if box.clickedButton() == switch_btn:
+            # User chose to switch to existing instance
+            sys.exit(0)
+        # User chose to open anyway - proceed with warning
+        print(
+            "[main] Warning: User chose to run multiple instances. "
+            "State file race conditions may occur.",
+            file=sys.stderr,
+        )
     app.setApplicationName("Plan Finder")
     app.setOrganizationName("PlanFinderGUI")
 
@@ -330,6 +459,16 @@ def main() -> None:
     window.setWindowTitle("Plan Finder")
     window.resize(1200, 800)
     window.show()
+
+    # Set up single-instance activation callback to bring window to foreground
+    # when another instance attempts to start
+    def _activate_window() -> None:
+        """Bring the main window to the foreground when another instance requests it."""
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    instance_guard.set_activation_callback(_activate_window)
 
     # SIGTERM (e.g. `kill`, Activity Monitor quit) → close the window normally
     # so closeEvent runs and subprocesses are cleaned up.
@@ -385,7 +524,11 @@ def main() -> None:
     QTimer.singleShot(800, _check_cli_version)
 
     with loop:
-        loop.run_forever()
+        try:
+            loop.run_forever()
+        finally:
+            # Clean up single-instance guard
+            instance_guard.release()
 
 
 if __name__ == "__main__":
