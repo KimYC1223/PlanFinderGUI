@@ -29,6 +29,7 @@ _FATAL_ERROR_PATTERNS = [
 ]
 
 MAX_CONSECUTIVE_ERRORS = 3
+MAX_CONSECUTIVE_PARSE_FAILURES = 5
 
 
 def _is_fatal_error(err_msg: str) -> bool:
@@ -175,6 +176,7 @@ async def run_discovery_loop(
     session_id: str | None = None
     session_start_time = _dt.now()
     consecutive_errors = 0
+    consecutive_parse_failures = 0
 
     stop_at_datetime = None
     if stop_at:
@@ -294,6 +296,7 @@ async def run_discovery_loop(
                 break
 
             consecutive_errors = 0
+            consecutive_parse_failures = 0
 
             if result.session_id:
                 session_id = result.session_id
@@ -304,7 +307,23 @@ async def run_discovery_loop(
                 throttle.add_usage(result.cost_usd, result.total_tokens, result.model)
 
             if result.plan is None:
-                display.log("Failed to get structured output from Claude. Retrying...")
+                consecutive_parse_failures += 1
+                display.log(
+                    f"Failed to get structured output from Claude "
+                    f"(attempt {consecutive_parse_failures}/{MAX_CONSECUTIVE_PARSE_FAILURES}). "
+                    f"Retrying..."
+                )
+                if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+                    display.on_error(
+                        "Too many consecutive parse failures. Claude is not returning valid "
+                        "structured output. Please check your prompt or report this issue."
+                    )
+                    break
+                # Reset session after 3 failures to give Claude a fresh context
+                if consecutive_parse_failures >= 3:
+                    display.log("Resetting session to get fresh context...")
+                    session_id = None
+                    session_start_time = _dt.now()
                 iteration -= 1
                 continue
 
