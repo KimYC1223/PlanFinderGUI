@@ -27,6 +27,39 @@ from . import sound_player
 
 
 # ---------------------------------------------------------------------------
+# Safe type conversion helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(value, default: int) -> int:
+    """Safely convert a QSettings value to int, returning default on failure.
+
+    QSettings values may be corrupted, manually edited with invalid data,
+    or have unexpected types due to cross-platform serialization differences.
+    This function ensures graceful degradation to a default value rather
+    than crashing the application.
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(value, default: float) -> float:
+    """Safely convert a QSettings value to float, returning default on failure.
+
+    QSettings values may be corrupted, manually edited with invalid data,
+    or have unexpected types due to cross-platform serialization differences.
+    This function ensures graceful degradation to a default value rather
+    than crashing the application.
+    """
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Auto-launch helpers (platform-specific)
 # ---------------------------------------------------------------------------
 
@@ -480,7 +513,7 @@ class SettingsDialog(QDialog):
 
     def _load(self) -> None:
         s = QSettings()
-        volume = int(s.value("sound_volume", 50))
+        volume = _safe_int(s.value("sound_volume", 50), 50)
         self._slider.setValue(volume)
         self._vol_pct.setText(f"{volume}%")
         self._autolaunch_check.setChecked(is_auto_launch_enabled())
