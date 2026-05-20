@@ -21,6 +21,10 @@ from .tool_summary import summarize_tool
 logger = logging.getLogger(__name__)
 
 
+class MaxTurnsExceededError(Exception):
+    """Raised when Claude hits the max_turns limit (ResultMessage.subtype == error_max_turns)."""
+
+
 @dataclass
 class DiscoveryResult:
     plan: DiscoveredPlan | None
@@ -191,14 +195,13 @@ async def discover_plan(
         # failed" exception with empty stderr — show the actual subtype
         # we captured during iteration instead.
         if last_result_subtype and last_result_subtype != "success":
+            if last_result_subtype == "error_max_turns":
+                raise MaxTurnsExceededError(
+                    f"error_max_turns: max_turns={max_turns}"
+                ) from e
             summary += (
                 f"\n\n실패 원인 (ResultMessage.subtype): {last_result_subtype}"
             )
-            if last_result_subtype == "error_max_turns":
-                summary += (
-                    f"\n→ 최대 턴({max_turns})을 초과했습니다. 환경설정에서 "
-                    f"'최대 턴' 값을 늘려보세요."
-                )
         stderr_text = stderr_buf.text()
         is_api_error = str(e).lower().startswith("claude api error")
         if stderr_text:

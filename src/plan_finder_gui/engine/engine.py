@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from .discovery import discover_plan
+from .discovery import MaxTurnsExceededError, discover_plan
 from .display_interface import DisplayInterface
 from .prompts import build_prompt
 from .reporter import save_plan, scan_existing_plans
@@ -205,6 +205,7 @@ async def run_discovery_loop(
     session_start_time = _dt.now()
     consecutive_errors = 0
     consecutive_parse_failures = 0
+    original_max_turns = max_turns
 
     stop_at_datetime = None
     if stop_at:
@@ -273,6 +274,28 @@ async def run_discovery_loop(
                 continue
             except asyncio.CancelledError:
                 raise
+            except MaxTurnsExceededError:
+                display.on_error(f"최대 턴({max_turns}) 도달.")
+                if max_turns < original_max_turns * 2:
+                    max_turns = min(max_turns + 20, original_max_turns * 2)
+                    display.log(f"최대 턴을 {max_turns}으로 증가 후 재시도.")
+                else:
+                    if resume:
+                        resume = False
+                        display.log(
+                            f"최대 턴 상한({original_max_turns * 2}) 도달."
+                            " 매 반복 새 세션으로 전환 후 계속."
+                        )
+                    else:
+                        display.log(
+                            f"최대 턴 상한({original_max_turns * 2}) 도달,"
+                            " 새 세션 이미 활성. 현 상태로 계속."
+                        )
+                session_id = None
+                session_start_time = _dt.now()
+                consecutive_errors = 0
+                iteration -= 1
+                continue
             except Exception as e:
                 err_msg = str(e)
                 if _is_fatal_error(err_msg):
